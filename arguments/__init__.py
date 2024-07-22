@@ -52,7 +52,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._dataset = ""
         self.w_mask = False
-        self._resolution = -1
+        self._resolution = 2.0
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False

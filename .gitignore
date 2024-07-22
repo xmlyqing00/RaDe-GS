@@ -13,3 +13,6 @@ utils/__pycache__
 debug*
 dtu_eval/Offical_DTU_Dataset
 *.sh
+
+results/
+dtu_eval/

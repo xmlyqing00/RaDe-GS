@@ -19,7 +19,7 @@ def apply_colormap(image, cmap="viridis"):
 
 def apply_depth_colormap(
     depth,
-    accumulation,
+    accumulation = None,
     near_plane = 2.0,
     far_plane = 4.0,
     cmap="turbo",

@@ -179,7 +179,7 @@ def evaluate_mesh(dataset : ModelParams, iteration : int, DTU_PATH : str):
     mesh = trimesh.load(mesh_file)
     
     print("cull")
-    mesh = cull_mesh(train_cameras, mesh)
+    # mesh = cull_mesh(train_cameras, mesh)
     
     culled_mesh_file = os.path.join(dataset.model_path, "recon_culled.ply")
     mesh.export(culled_mesh_file)
@@ -195,7 +195,9 @@ def evaluate_mesh(dataset : ModelParams, iteration : int, DTU_PATH : str):
     out_dir = os.path.join(dataset.model_path, "vis")
     os.makedirs(out_dir,exist_ok=True)
     # scan = dataset.model_path.split("/")[-1][4:]
-    scan = int(dataset.source_path.split("/")[-1][4:])
+    print(dataset.source_path)
+    # scan = int(dataset.source_path.split("/")[-1][4:])
+    scan = dataset.source_path.split('scan')[1]
     
     cmd = f"python dtu_eval/eval.py --data {aligned_mesh_file} --scan {scan} --mode mesh --dataset_dir {DTU_PATH} --vis_out_dir {out_dir}"
     print(cmd)
@@ -211,7 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--scan_id', type=str,  help='scan id of the input mesh')
-    parser.add_argument('--DTU', type=str,  default='dtu_eval/Offical_DTU_Dataset', help='path to the GT DTU point clouds')
+    parser.add_argument('--DTU', type=str,  default='dtu_eval/Official_DTU_Dataset', help='path to the GT DTU point clouds')
     
     args = get_combined_args(parser)
     print("evaluating " + args.model_path)

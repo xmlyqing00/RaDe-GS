@@ -18,7 +18,12 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
+import imageio
+import numpy as np
+import torchvision
+from pathlib import Path
 from tqdm import tqdm
+from utils.vis_utils import apply_depth_colormap
 from utils.image_utils import psnr
 from utils.graphics_utils import depth_double_to_normal
 from argparse import ArgumentParser, Namespace
@@ -74,6 +79,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     trainCameras = scene.getTrainCameras().copy()
     gaussians.compute_3D_filter(cameras=trainCameras)
+
+    verbose = True
+    if verbose:
+        out_dir = Path(scene.model_path) / 'render'
+        out_dir.mkdir(parents=True, exist_ok=True)
     
     viewpoint_stack = None
     ema_loss_for_log, ema_depth_loss_for_log, ema_mask_loss_for_log, ema_normal_loss_for_log = 0.0, 0.0, 0.0, 0.0
@@ -136,6 +146,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1_render = l1_loss(rendered_image, gt_image)
 
+        if verbose and iteration % 20 == 0:
+            loss_map = torch.abs(rendered_image - gt_image).sum(dim=0)
+            torchvision.utils.save_image(loss_map, out_dir / f'{iteration:05d}_l1loss.png')
+            torchvision.utils.save_image(rendered_image, out_dir / f'{iteration:05d}_rendered.png')
+            torchvision.utils.save_image(gt_image, out_dir / f'{iteration:05d}_gt.png')
+
+            depth_img = apply_depth_colormap(rendered_depth.permute(1, 2, 0)).cpu().numpy() * 255
+            imageio.imwrite(out_dir / f'{iteration:05d}_depth.png', depth_img.astype(np.uint8))
+
+            tmp = torch.nn.functional.normalize(rendered_normal, p=2, dim=0)
+            tmp = tmp.permute(1,2,0)
+            rendered_normal_img = np.clip(np.rint(tmp.detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+            imageio.imwrite(out_dir / f'{iteration:05d}_normal.png', rendered_normal_img)
+
         
         if iteration >= opt.regularization_from_iter:
             # depth distortion loss
@@ -154,6 +178,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_error_map = (1 - (rendered_normal.unsqueeze(0) * depth_middepth_normal).sum(dim=-1))
             depth_normal_loss = (1-depth_ratio) * normal_error_map[0].mean() + depth_ratio * normal_error_map[1].mean()
             lambda_depth_normal = opt.lambda_depth_normal
+
+            if verbose and iteration % 20 == 0:
+
+                depth_img = apply_depth_colormap(rendered_depth.permute(1, 2, 0)).cpu().numpy() * 255
+                imageio.imwrite(out_dir / f'{iteration:05d}_depth.png', depth_img.astype(np.uint8))
+
+                rendered_normal_img = np.clip(np.rint(rendered_normal.detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                imageio.imwrite(out_dir / f'{iteration:05d}_normal.png', rendered_normal_img)
+
+                depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                imageio.imwrite(out_dir / f'{iteration:05d}_normal_from_depth0.png', depth_middepth_normal_map)
+
+                depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[1].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                imageio.imwrite(out_dir / f'{iteration:05d}_normal_from_depth1.png', depth_middepth_normal_map)
+
+                normal_error_img = np.clip(np.rint(normal_error_map[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                imageio.imwrite(out_dir / f'{iteration:05d}_normal_err0.png', normal_error_img)
+
+                normal_error_img = np.clip(np.rint(normal_error_map[1].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                imageio.imwrite(out_dir / f'{iteration:05d}_normal_err1.png', normal_error_img)
+
         else:
             lambda_distortion = 0
             lambda_depth_normal = 0
@@ -307,7 +352,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
+    network_gui.init(args.ip, args.port)
     # torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(dataset=lp.extract(args), 
              opt=op.extract(args), 

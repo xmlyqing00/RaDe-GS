@@ -17,8 +17,12 @@ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 
 
-def load_camera_colmap(args):
-    scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+def load_camera(args):
+    if os.path.exists(os.path.join(args.source_path, "sparse")):
+        scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+    elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        print("Found transforms_train.json file, assuming Blender data set!")
+        scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, gap = 1)    
     return cameraList_from_camInfos(scene_info.train_cameras, 1.0, args)
 
 
@@ -39,7 +43,7 @@ def extract_mesh(dataset, pipe, checkpoint_iterations=None):
     
     bg_color = [1, 1, 1]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    viewpoint_cam_list = load_camera_colmap(dataset)
+    viewpoint_cam_list = load_camera(dataset)
 
     depth_list = []
     color_list = []
