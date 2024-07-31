@@ -15,8 +15,10 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
+from scene.lap_pyramid import build_lap_pyramid
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
 
 class Scene:
 
@@ -44,7 +46,13 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, gap = gap)
+            scene_info = sceneLoadTypeCallbacks["Blender"](
+                args.source_path, 
+                args.white_background, 
+                args.eval, 
+                gap = gap, 
+                use_lap_pyramid=args.use_lap_pyramid
+            )
         
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
@@ -72,13 +80,39 @@ class Scene:
             
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
             print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
+        
+        if args.use_lap_pyramid:
+            for resolution_scale in resolution_scales:
+                self.train_cameras[resolution_scale] = build_lap_pyramid(
+                    self.train_cameras[resolution_scale], 
+                    args.lap_pyramid_level, 
+                    'cuda',
+                    args.lap_pyramid_debug, 
+                    self.model_path,
+                    'train'
+                )
+                self.test_cameras[resolution_scale] = build_lap_pyramid(
+                    self.test_cameras[resolution_scale], 
+                    args.lap_pyramid_level, 
+                    'cuda',
+                    args.lap_pyramid_debug,
+                    self.model_path,
+                    'test'
+                )
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-        self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+        self.scene_info = scene_info
+        self.init_gaussian()    
+
+
+    def init_gaussian(self):
+
+        self.gaussians.create_from_pcd(self.scene_info.point_cloud, self.cameras_extent)
+
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

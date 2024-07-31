@@ -314,7 +314,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png", gap = 1):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", gap = 1, use_lap_pyramid: bool = False):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
@@ -328,9 +328,12 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", gap = 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
+    if True or not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
+        if use_lap_pyramid:
+            num_pts = 10_000
+        else:
+            num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
         
         # We create random points inside the bounds of the synthetic Blender scenes

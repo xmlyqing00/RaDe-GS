@@ -16,7 +16,15 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0):
+def render(
+        viewpoint_camera, 
+        pc : GaussianModel, 
+        pipe, 
+        bg_color : torch.Tensor, 
+        scaling_modifier = 1.0, 
+        image_height: int = None, 
+        image_width: int = None
+    ):
     """
     Render the scene. 
     
@@ -31,10 +39,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         screenspace_points.retain_grad()
     except:
         pass
+    
+    if image_height is None or image_width is None:
+        image_height = int(viewpoint_camera.image_height)
+        image_width = int(viewpoint_camera.image_width)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=image_height,
+        image_width=image_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -91,7 +103,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             }
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py
-def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, image_height: int = None, image_width: int = None):
     """
     integrate Gaussians to the points, we also render the image for visual comparison. 
     
@@ -109,10 +121,13 @@ def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, bg_color : t
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-        
+    if image_height is None or image_width is None:
+        image_height = int(viewpoint_camera.image_height)
+        image_width = int(viewpoint_camera.image_width)
+
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=image_height,
+        image_width=image_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,

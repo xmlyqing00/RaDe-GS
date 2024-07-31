@@ -140,7 +140,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image
         edge = viewpoint_cam.edge
 
-        
         if dataset.use_decoupled_appearance:
             Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         else:

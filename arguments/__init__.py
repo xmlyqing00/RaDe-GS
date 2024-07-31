@@ -52,11 +52,14 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._dataset = ""
         self.w_mask = False
-        self._resolution = 2.0
+        self._resolution = 1.0
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
         self.use_decoupled_appearance = False
+        self.use_lap_pyramid = True
+        self.lap_pyramid_level: int = 4
+        self.lap_pyramid_debug: bool = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -90,11 +93,17 @@ class OptimizationParams(ParamGroup):
         self.lambda_distortion = 100
         self.lambda_depth_normal = 0.05
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000
+        self.opacity_reset_interval = 1000 # 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.regularization_from_iter = 15_000
+        self.densify_until_iter = 2500 # 15_000
+        # self.regularization_from_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        self.lap_level_upgrade_interval = 4_000
+        self.depth_opt_from_iter = 2_500
+        self.union_l1loss_interval = 3_000
+
+        self.verbose = True
 
         super().__init__(parser, "Optimization Parameters")
 

@@ -95,7 +95,7 @@ def focal2fov(focal, pixels):
 
 # the following functions depths_double_to_points and depth_double_to_normal are adopted from https://github.com/hugoycj/2dgs-gaustudio/blob/main/utils/graphics_utils.py
 def depths_double_to_points(view, depthmap1, depthmap2):
-    W, H = view.image_width, view.image_height
+    W, H = depthmap1.shape[1:]
     fx = W / (2 * math.tan(view.FoVx / 2.))
     fy = H / (2 * math.tan(view.FoVy / 2.))
     intrins = torch.tensor(
@@ -113,7 +113,6 @@ def depths_double_to_points(view, depthmap1, depthmap2):
     return points1, points2
 
 
-
 def depth_double_to_normal(view, depth1, depth2):
     points1, points2 = depths_double_to_points(view, depth1, depth2)
     points = torch.stack([points1, points2],dim=0).reshape(2, *depth1.shape[1:], 3)
@@ -123,6 +122,7 @@ def depth_double_to_normal(view, depth1, depth2):
     normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
     output[:,1:-1, 1:-1, :] = normal_map
     return output, points
+
 
 def bilinear_sampler(img, coords, mask=False):
     """ Wrapper for grid_sample, uses pixel coordinates """
