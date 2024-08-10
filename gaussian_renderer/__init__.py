@@ -11,7 +11,7 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_neutral_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
@@ -77,7 +77,7 @@ def render(
     shs = pc.get_features
     colors_precomp = None
 
-    rendered_image, radii, rendered_depth, rendered_middepth, rendered_alpha, rendered_normal, depth_distortion = rasterizer(
+    rendered_image, radii, rendered_depth, rendered_middepth, rendered_alpha, rendered_alpha_t, rendered_normal, depth_distortion = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -93,6 +93,7 @@ def render(
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
             "mask": rendered_alpha,
+            "alpha_t": rendered_alpha_t,
             "depth": rendered_depth,
             "middepth": rendered_middepth,
             "viewspace_points": means2D,

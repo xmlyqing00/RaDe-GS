@@ -11,6 +11,8 @@
 
 import os
 import torch
+import trimesh
+import datetime
 from random import randint, shuffle
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -24,9 +26,9 @@ import numpy as np
 import torchvision
 from pathlib import Path
 from tqdm import tqdm
-from utils.vis_utils import apply_depth_colormap, apply_colormap
+from utils.vis_utils import apply_depth_colormap, apply_colormap, build_spheres
 from utils.image_utils import psnr
-from utils.graphics_utils import depth_double_to_normal
+from utils.graphics_utils import depth_double_to_normal, depth_to_points, depth_to_points_fast
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -35,7 +37,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-TENSORBOARD_FOUND = False
+# TENSORBOARD_FOUND = False
 
 from scene.cameras import Camera
 
@@ -69,6 +71,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, gap = pipe.interval)
+    # scene.init_gaussian_from_pcd()
+
+    trainCameras = scene.getTrainCameras().copy()
+    gaussians.training_setup(opt)
+    gaussians.compute_3D_filter(cameras=trainCameras)
+
     # if checkpoint:
         # (model_params, first_iter) = torch.load(checkpoint)
         # gaussians.restore(model_params, opt)
@@ -82,10 +90,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         out_dir = Path(scene.model_path) / 'render'
         out_dir.mkdir(parents=True, exist_ok=True)
     
-    # kernel_size = 5
-    # half_kernel_size = kernel_size // 2
-    # kernel = lap_pyramid.get_gaussian_kernel(5).to('cuda')
-
     pc_pyramid = {}
     total_iter = 0
     render_pkg_last = {}
@@ -97,12 +101,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_stack = None
         ema_loss_for_log, ema_depth_loss_for_log, ema_mask_loss_for_log, ema_normal_loss_for_log = 0.0, 0.0, 0.0, 0.0
         progress_bar = tqdm(range(1, opt.lap_level_upgrade_interval + 1), desc="Training progress")
-
-        scene.init_gaussian()
-        gaussians.training_setup(opt)
-
-        trainCameras = scene.getTrainCameras().copy()
-        gaussians.compute_3D_filter(cameras=trainCameras)
 
         for iteration in range(1, opt.lap_level_upgrade_interval + 1):
 
@@ -135,8 +133,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not viewpoint_stack:
                 viewpoint_stack = scene.getTrainCameras().copy()
                 shuffle(viewpoint_stack)
-                
-            viewpoint_cam: Camera = viewpoint_stack.pop()
+            
+            if cur_lap_level == dataset.lap_pyramid_level - 1:
+                viewpoint_cam = viewpoint_stack.pop()
+            else:
+                viewpoint_cam: Camera = viewpoint_stack[0]
             # gt_image = viewpoint_cam.original_image
             gt_image = viewpoint_cam.gauss_pyramid[cur_lap_level].squeeze(0)
 
@@ -149,15 +150,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                                         render_pkg["radii"])
             
             rendered_mask: torch.Tensor = render_pkg["mask"]
+            rendered_alpha_t: torch.Tensor = render_pkg["alpha_t"]
             rendered_depth: torch.Tensor = render_pkg["depth"]
             rendered_middepth: torch.Tensor = render_pkg["middepth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_distortion: torch.Tensor = render_pkg["depth_distortion"]
+            rendered_depth = rendered_depth / rendered_mask
+            rendered_depth = torch.nan_to_num(rendered_depth, 0, 0)
+
  
             if cur_lap_level == dataset.lap_pyramid_level - 1:
                 final_image = rendered_image
             else:
-                final_image = 2 * rendered_image - 1 + render_pkg_last[viewpoint_cam.image_name]['render']
+                view_pkg_last = render_pkg_last[viewpoint_cam.image_name]
+                render_fix_front = render_pkg['render'] + view_pkg_last['render'] * rendered_alpha_t # auto broadcast .repeat(3, 1, 1)
+                render_fix_back = view_pkg_last['render'] + render_pkg['render'] * view_pkg_last['alpha_t'] # auto broadcast .repeat(3, 1, 1)
+                final_image = torch.where(view_pkg_last['depth'] > rendered_depth, render_fix_front, render_fix_back)
+                # x = rendered_depth.view(-1) == 0
+                # rendered_image = rendered_image.view(3, -1)[:, x]
 
             if dataset.use_decoupled_appearance:
                 Ll1_render = L1_loss_appearance(final_image, gt_image, gaussians, viewpoint_cam.uid)
@@ -170,12 +180,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     torch.clip(torch.max(rendered_image, dim=0, keepdim=True)[0].permute(1, 2, 0), min=0, max=1)
                 ).permute(2, 0, 1)
 
-                torchvision.utils.save_image(rendered_mask, out_dir / f'{total_iter:05d}_alpha.png')
+                torchvision.utils.save_image(rendered_alpha_t, out_dir / f'{total_iter:05d}_alpha_t.png')
                 torchvision.utils.save_image(loss_map, out_dir / f'{total_iter:05d}_l1loss.png')
                 torchvision.utils.save_image(rendered_image, out_dir / f'{total_iter:05d}_rendered.png')
                 torchvision.utils.save_image(rendered_image_color, out_dir / f'{total_iter:05d}_rendered_color.png')
                 torchvision.utils.save_image(final_image, out_dir / f'{total_iter:05d}_final.png')
                 torchvision.utils.save_image(gt_image, out_dir / f'{total_iter:05d}_gt.png')
+
+                if cur_lap_level != dataset.lap_pyramid_level - 1:
+                    view_pkg_last = render_pkg_last[viewpoint_cam.image_name]
+                    torchvision.utils.save_image(view_pkg_last['render'], out_dir / f'{total_iter:05d}_last_rendered.png')
+                    torchvision.utils.save_image(view_pkg_last['alpha_t'], out_dir / f'{total_iter:05d}_last_alpha_t.png')
+                    torchvision.utils.save_image(render_fix_front, out_dir / f'{total_iter:05d}_render_fix_front.png')
+                    torchvision.utils.save_image(render_fix_back, out_dir / f'{total_iter:05d}_render_fix_back.png')
+                    torchvision.utils.save_image((view_pkg_last['depth'] > rendered_depth).float(), out_dir / f'{total_iter:05d}_depth_test.png')
+                    
+
+                    depth_diff = view_pkg_last['depth'] - rendered_depth
+                    depth_diff = torch.clip(depth_diff + 0.5, 0, 1).permute(1, 2, 0)
+                    depth_diff_img = apply_colormap(depth_diff).permute(2, 0, 1)
+                    torchvision.utils.save_image(depth_diff_img, out_dir / f'{total_iter:05d}_depth_diff.png')
 
                 depth_img = apply_depth_colormap(rendered_depth.permute(1, 2, 0)).cpu().numpy() * 255
                 imageio.imwrite(out_dir / f'{total_iter:05d}_depth.png', depth_img.astype(np.uint8))
@@ -194,8 +218,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 distortion_loss = distortion_map.mean()
 
                 # normal consistency loss
-                rendered_depth = rendered_depth / rendered_mask
-                rendered_depth = torch.nan_to_num(rendered_depth, 0, 0)
                 depth_middepth_normal, _ = depth_double_to_normal(viewpoint_cam, rendered_depth, rendered_middepth)
                 depth_ratio = 0.6
                 rendered_normal = torch.nn.functional.normalize(rendered_normal, p=2, dim=0)
@@ -271,6 +293,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.compute_3D_filter(cameras=trainCameras)
 
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        print("\n[ITER {}] Reset Gaussians opacity".format(total_iter))
                         gaussians.reset_opacity()
                     
                 if iteration % 100 == 0 and iteration > opt.densify_until_iter:
@@ -292,15 +315,86 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if cur_lap_level > 0:
             viewpoint_stack = scene.getTrainCameras().copy()
+            upscale_loss_dir = out_dir / f'upscale_{cur_lap_level}'
+            upscale_loss_dir.mkdir(parents=True, exist_ok=True)
+
+            upscale_loss_top_dir = out_dir / f'upscale_{cur_lap_level}_top_best'
+            upscale_loss_top_dir.mkdir(parents=True, exist_ok=True)
+
+            depth_disturbs = [0.98, 1.02]
             
             with torch.no_grad():
-                for view in tqdm(viewpoint_stack, desc='Save last rendering results'):
+                l1_test = 0.0
+                psnr_test = 0.0
+                step = len(viewpoint_stack) // opt.new_gauss_view_num
 
-                    next_gt_image = viewpoint_cam.gauss_pyramid[cur_lap_level - 1].squeeze(0)
+                pts_xyz_collection = torch.empty(0, 3, device='cuda')
+                pts_radius_collection = torch.empty(0, 1, device='cuda')
+                pts_color_collection = torch.empty(0, 3, device='cuda')
+
+                for view_idx, view in tqdm(enumerate(viewpoint_stack), desc='Save last rendering results'):
+
+                    next_gt_image = view.gauss_pyramid[cur_lap_level - 1].squeeze(0)
 
                     render_pkg = render(view, gaussians, pipe, background, image_height=next_gt_image.shape[1], image_width=next_gt_image.shape[2])
+                    render_pkg['depth'] = render_pkg['depth'] / render_pkg['mask']
+                    render_pkg['depth'] = torch.nan_to_num(render_pkg['depth'], 0, 0)
                     render_pkg_last[view.image_name] = render_pkg
                     render_pkg_last[view.image_name]['render_loss'] = torch.abs(next_gt_image - render_pkg['render'])
+
+                    l1_res = render_pkg_last[view.image_name]['render_loss'].mean().double()
+                    l1_test += l1_res
+                    psnr_test += psnr(render_pkg['render'], next_gt_image).mean().double()
+
+                    torchvision.utils.save_image(render_pkg_last[view.image_name]['render_loss'], upscale_loss_dir / f'{view.image_name}_l1loss.png')
+                    torchvision.utils.save_image(render_pkg['render'], upscale_loss_dir / f'{view.image_name}_render.png')
+                    torchvision.utils.save_image(next_gt_image, upscale_loss_dir / f'{view.image_name}_gt.png')
+
+                    if view_idx % step == 0:
+                        
+                        pts_bad = render_pkg_last[view.image_name]['render_loss'].sum(dim=0) > opt.new_gauss_l1loss_thres
+                        if opt.verbose:
+                            torchvision.utils.save_image(pts_bad.float(), upscale_loss_dir / f'{view.image_name}_bad.png')
+
+                        for depth_disturb in depth_disturbs:
+                            print('Add new Gaussians at', view_idx, 'with depth_disturb', depth_disturb)
+                            pts_xyz, pts_radius = depth_to_points_fast(view, render_pkg['depth'] * depth_disturb)
+                            pts_color = next_gt_image.permute(1, 2, 0).reshape(-1, 3)
+
+                            pts_mask = pts_radius.squeeze(1) > 0
+                            pts_mask = pts_mask & pts_bad.reshape(-1)
+                            pts_xyz = pts_xyz[pts_mask]
+                            pts_radius = pts_radius[pts_mask]
+                            pts_color = pts_color[pts_mask]
+                            pts_xyz_view = torch.concat([pts_xyz, torch.ones_like(pts_radius)], dim=-1)
+                            pts_xyz_world = pts_xyz_view @ view.world_view_transform_inv
+                            pts_xyz_world = pts_xyz_world[:, :3]
+
+                            pts_xyz_collection = torch.cat([pts_xyz_collection, pts_xyz_world], dim=0)
+                            pts_radius_collection = torch.cat([pts_radius_collection, pts_radius], dim=0)
+                            pts_color_collection = torch.cat([pts_color_collection, pts_color], dim=0)
+
+                            if opt.verbose:
+                                vis_spheres: trimesh.Trimesh = build_spheres(
+                                    pts_xyz_world.cpu().detach().numpy(), 
+                                    pts_radius.cpu().detach().numpy(), 
+                                    pts_color.cpu().detach().numpy()
+                                )
+                                vis_spheres.export(upscale_loss_dir / f'{view.image_name}_spheres_world_scale_sqrt2_{depth_disturb:.3f}.ply')
+                        
+                l1_test /= len(viewpoint_stack)
+                psnr_test /= len(viewpoint_stack)
+
+                print(f"\n[ITER {total_iter} Upscale] Evaluating Train: L1 {l1_test} PSNR {psnr_test}")
+
+                gaussians.__init__(dataset.sh_degree)
+                scene.init_gaussian_from_pts(pts_xyz_collection, pts_radius_collection, pts_color_collection)
+                gaussians.training_setup(opt)
+                gaussians.compute_3D_filter(cameras=trainCameras)
+
+                render_new_gauss_pkg = render(view, gaussians, pipe, background, image_height=next_gt_image.shape[1], image_width=next_gt_image.shape[2])
+                torchvision.utils.save_image(render_new_gauss_pkg['render'], upscale_loss_dir / f'new_gauss_render.png')
+
 
 
 def prepare_output_and_logger(args):    
@@ -310,6 +404,9 @@ def prepare_output_and_logger(args):
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
+    else:
+        current_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.model_path = os.path.join(args.model_path, current_time)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -329,11 +426,20 @@ def prepare_output_and_logger(args):
 def training_report(tb_writer, iter, total_iter, lap_level, report_loss, l1_loss, elapsed, testing_iterations, scene : Scene, last_pc: GaussianModel, renderArgs):
     Ll1, loss, depth_loss, normal_loss = report_loss
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), total_iter)
-        tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), total_iter)
-        tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), total_iter)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), total_iter)
+        tb_writer.add_scalar('train/l1_loss', Ll1.item(), total_iter)
+        tb_writer.add_scalar('train/depth_loss', depth_loss.item(), total_iter)
+        tb_writer.add_scalar('train/normal_loss', normal_loss.item(), total_iter)
+        tb_writer.add_scalar('train/total_loss', loss.item(), total_iter)
+        tb_writer.add_scalar('train/gauss_num', scene.gaussians.get_xyz.shape[0], total_iter)
         tb_writer.add_scalar('iter_time', elapsed, total_iter)
+        tb_writer.add_scalar('grad/feature_dc', scene.gaussians._features_dc.grad.abs().max(), total_iter)
+        tb_writer.add_scalar('grad/feature_rest', scene.gaussians._features_rest.grad.abs().max(), total_iter)
+        tb_writer.add_scalar('grad/opacity', scene.gaussians._opacity.grad.abs().max(), total_iter)
+        tb_writer.add_scalar('grad/scaling', scene.gaussians._scaling.grad.abs().max(), total_iter)
+
+        for param_group in scene.gaussians.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                tb_writer.add_scalar('scene/lr_xyz', param_group['lr'], total_iter)
 
     # Report test and samples of training set
     if iter in testing_iterations:
@@ -361,7 +467,10 @@ def training_report(tb_writer, iter, total_iter, lap_level, report_loss, l1_loss
                             *renderArgs, 
                             image_height=gt_image.shape[1], image_width=gt_image.shape[2]
                         ) 
-                        render_image = 2 * render_result['render'] - 1 + last_render_result['render']
+                        render_fix_front = render_result['render'] + last_render_result['render'] * render_result['alpha_t']
+                        render_fix_back = last_render_result['render'] + render_result['render'] * last_render_result['alpha_t']
+                        render_image = torch.where(last_render_result['depth'] > render_result['depth'], render_fix_front, render_fix_back)
+
                     else:
                         render_image = render_result['render']
                      

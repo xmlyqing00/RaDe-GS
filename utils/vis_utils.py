@@ -5,6 +5,8 @@ from matplotlib import cm
 import open3d as o3d
 import matplotlib.pyplot as plt
 import numpy as np
+from trimesh import primitives, util
+
 
 def apply_colormap(image, cmap="viridis"):
     colormap = cm.get_cmap(cmap)
@@ -78,3 +80,19 @@ def colormap(img, cmap='jet'):
     if img.shape[1:] != (H, W):
         img = torch.nn.functional.interpolate(img[None], (W, H), mode='bilinear', align_corners=False)[0]
     return img
+
+
+def build_spheres(pt: np.array, radius: np.array, color: np.array):
+    
+    if pt.ndim > 1:
+        meshes = []
+        for i in range(pt.shape[0]):
+            r = radius[i] if radius.ndim > 1 else radius
+            c = color[i] if color.ndim > 1 else color
+            meshes.append(build_spheres(pt[i], r, c))
+        return util.concatenate(meshes)
+
+    sphere = primitives.Sphere(radius=radius, center=pt, subdivisions=2)
+    sphere.visual.vertex_colors = color
+
+    return sphere

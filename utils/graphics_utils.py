@@ -113,6 +113,47 @@ def depths_double_to_points(view, depthmap1, depthmap2):
     return points1, points2
 
 
+def depth_to_points(view, depth):
+    W, H = depth.shape[1:]
+    fx = W / (2 * math.tan(view.FoVx / 2.))
+    fy = H / (2 * math.tan(view.FoVy / 2.))
+    intrins = torch.tensor(
+        [[fx, 0., W/2.],
+        [0., fy, H/2.],
+        [0., 0., 1.0]]
+    ).float().cuda()
+    grid_x, grid_y = torch.meshgrid(torch.arange(W)+0.5, torch.arange(H)+0.5, indexing='xy')
+    points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3).float().cuda()
+    rays_d = points @ intrins.inverse().T
+    points = depth.reshape(-1, 1) * rays_d
+
+    points_gap = torch.ones((1, 3), device=points.device)
+    points_gap[0, 2] = 0
+    rays_d_gap = points_gap @ intrins.inverse().T
+    radius = depth.reshape(-1, 1) * rays_d_gap[:, 0:1]
+    radius = abs(radius) / 2 * 1.414  # sqrt(2)
+
+    return points, radius
+
+
+def depth_to_points_fast(view, depth):
+    W, H = depth.shape[1:]
+    intrins_inv = view.basic_intrins_inv.clone()
+    intrins_inv[0, 0] /= W
+    intrins_inv[1, 1] /= H
+    grid_x, grid_y = torch.meshgrid(torch.arange(W)+0.5, torch.arange(H)+0.5, indexing='xy')
+    points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3).float().cuda()
+    rays_d = points @ intrins_inv
+    points = depth.reshape(-1, 1) * rays_d
+
+    points_gap = torch.tensor([[1.0, 1.0, 0.0]], device=points.device)
+    rays_d_gap = points_gap @ intrins_inv
+    radius = depth.reshape(-1, 1) * rays_d_gap[:, 0:1]
+    radius = abs(radius) * 0.707  # sqrt(2) / 2
+
+    return points, radius
+
+
 def depth_double_to_normal(view, depth1, depth2):
     points1, points2 = depths_double_to_points(view, depth1, depth2)
     points = torch.stack([points1, points2],dim=0).reshape(2, *depth1.shape[1:], 3)

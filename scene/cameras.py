@@ -11,6 +11,7 @@
 
 import torch
 from torch import nn
+import math
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
@@ -76,6 +77,16 @@ class Camera(nn.Module):
             max_grad = torch.nn.functional.pad(max_grad, (1, 1, 1, 1), mode="constant", value=0)
             self.edge = max_grad
 
+        self.world_view_transform_inv = torch.inverse(self.world_view_transform)
+        fx = 1 / (2 * math.tan(self.FoVx / 2.))
+        fy = 1 / (2 * math.tan(self.FoVy / 2.))
+        basic_intrins = torch.tensor(
+            [[fx, 0., 1/2.],
+            [0., fy, 1/2.],
+            [0., 0., 1.0]],
+            device=self.data_device
+        ).float()
+        self.basic_intrins_inv = torch.inverse(basic_intrins).T
 
 
 class MiniCam:

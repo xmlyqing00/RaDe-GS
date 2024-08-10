@@ -331,7 +331,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", gap = 
     if True or not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
         if use_lap_pyramid:
-            num_pts = 10_000
+            num_pts = 1_000
         else:
             num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")

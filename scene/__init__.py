@@ -12,6 +12,7 @@
 import os
 import random
 import json
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -106,12 +107,15 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         self.scene_info = scene_info
-        self.init_gaussian()    
+        self.init_gaussian_from_pcd()    
 
 
-    def init_gaussian(self):
-
+    def init_gaussian_from_pcd(self):
         self.gaussians.create_from_pcd(self.scene_info.point_cloud, self.cameras_extent)
+
+    
+    def init_gaussian_from_pts(self, pts_xyz_world: torch.Tensor, pts_radius: torch.Tensor, pts_color: torch.Tensor):
+        self.gaussians.create_from_pts(pts_xyz_world, pts_radius, pts_color, self.cameras_extent)
 
 
     def save(self, iteration):
