@@ -20,13 +20,19 @@ include_directories(
 	${Boost_INCLUDE_DIRS}
 	${picojson_INCLUDE_DIRS}
 	${rapidxml_INCLUDE_DIRS}
+	${nativefiledialog_INCLUDE_DIRS}
 )
 if (WIN32)
+# message(STATUS "CMAKE_INSTALL_ROOT: ${CMAKE_INSTALL_ROOT}")
+# find_library(NFD nfd PATHS ${CMAKE_INSTALL_ROOT}/lib/)
+# find_library(nativefiledialog nativefiledialog_rwdi PATHS ${CMAKE_INSTALL_ROOT}/lib/)
+# message(STATUS "NFD: ${NFD}")
+# message(STATUS "nativefiledialog: ${nativefiledialog}")
 target_link_libraries(${PROJECT_NAME}
 	${Boost_LIBRARIES}
 	picojson
 	rapidxml
-	nfd
+	nativefiledialog
 )
 else()
 target_link_libraries(${PROJECT_NAME}
