@@ -329,21 +329,23 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
 
-
-    def create_from_pts(self, pts_xyz_world: torch.Tensor, pts_radius: torch.Tensor, pts_color: torch.Tensor, spatial_lr_scale : float):
+    def create_from_pts(self, pts_xyz_world: torch.Tensor, pts_radius: torch.Tensor, pts_color: torch.Tensor, spatial_lr_scale : float, init: bool = False):
         
         n = pts_xyz_world.shape[0]
         fused_color = RGB2SH(pts_color)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
-        scales = torch.log(pts_radius).repeat(1, 3)
+        scales = torch.log(pts_radius).repeat(1, 3).cuda()
         rots = torch.zeros((n, 4), device="cuda")
         rots[:, 0] = 1
         opacities = inverse_sigmoid(0.1 * torch.ones((n, 1), dtype=torch.float, device="cuda"))
         
-        self.init_params(pts_xyz_world, features, scales, rots, opacities)
-        self.spatial_lr_scale = spatial_lr_scale
+        if init:
+            self.init_params(pts_xyz_world, features, scales, rots, opacities)
+            self.spatial_lr_scale = spatial_lr_scale
+        else:
+            self.densification_postfix(pts_xyz_world, features[:,:,0:1].transpose(1, 2), features[:,:,1:].transpose(1, 2), opacities, scales, rots)
 
         print(f"Number of points at initialisation : {n}")
 
@@ -737,14 +739,16 @@ class GaussianModel:
 
 
     # use the same densification strategy as GOF https://github.com/autonomousvision/gaussian-opacity-fields
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, old_gaussian_num: int):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        grads[:old_gaussian_num] = 0.0
 
         grads_abs = self.xyz_gradient_accum_abs / self.denom
         grads_abs[grads_abs.isnan()] = 0.0
-        ratio = (torch.norm(grads, dim=-1) >= max_grad).float().mean()
-        Q = torch.quantile(grads_abs.reshape(-1), 1 - ratio)
+        grads_abs[:old_gaussian_num] = 0.0
+        ratio = (torch.norm(grads[old_gaussian_num:], dim=-1) >= max_grad).float().mean()
+        Q = torch.quantile(grads_abs[old_gaussian_num:].reshape(-1), 1 - ratio)
         
         before = self._xyz.shape[0]
         self.densify_and_clone(grads, max_grad, grads_abs, Q, extent)
@@ -758,6 +762,8 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        
+        prune_mask[:old_gaussian_num] = False
         self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
         torch.cuda.empty_cache()
@@ -769,3 +775,5 @@ class GaussianModel:
         self.xyz_gradient_accum_abs_max[update_filter] = torch.max(self.xyz_gradient_accum_abs_max[update_filter], torch.norm(viewspace_point_tensor.grad[update_filter,2:], dim=-1, keepdim=True))
         self.denom[update_filter] += 1
 
+    def freeze_gaussians(self):
+        self.freeze_mask = torch.ones((self.get_xyz.shape[0]), device="cuda", dtype=torch.bool)
