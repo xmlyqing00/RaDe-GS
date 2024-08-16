@@ -124,10 +124,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             iter_start.record()
 
-            gaussians.update_learning_rate(iteration)
+            gaussians.update_learning_rate(total_iter)
 
             # Every 1000 its we increase the levels of SH up to a maximum degree
-            if iteration % 1000 == 0:
+            if total_iter % 1000 == 0:
                 gaussians.oneupSHdegree()
 
             # Pick a random Camera
@@ -176,7 +176,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 Ll1_render = l1_loss(final_image, gt_image)
 
-            if opt.verbose and iteration % 20 == 0:
+            if opt.verbose and (iteration % 50 == 0 or iteration < 100):
                 loss_map = torch.abs(final_image - gt_image).sum(dim=0)
                 rendered_image_color = apply_colormap(
                     torch.clip(torch.max(rendered_image, dim=0, keepdim=True)[0].permute(1, 2, 0), min=0, max=1)
@@ -227,7 +227,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_normal_loss = (1-depth_ratio) * normal_error_map[0].mean() + depth_ratio * normal_error_map[1].mean()
                 lambda_depth_normal = opt.lambda_depth_normal
 
-                if opt.verbose and iteration % 20 == 0:
+                if opt.verbose and iteration % 50 == 0:
 
                     depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
                     imageio.imwrite(out_dir / f'{total_iter:05d}_normal_from_depth0.png', depth_middepth_normal_map)
@@ -422,7 +422,7 @@ def prepare_output_and_logger(args, verbose):
 
     # Create Tensorboard writer
     tb_writer = None
-    if TENSORBOARD_FOUND and verbose:
+    if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
     else:
         if not TENSORBOARD_FOUND:
@@ -513,8 +513,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2500, 4000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2_500, 4_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5000, 10000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5000, 10000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[15000])
     parser.add_argument("--start_checkpoint", type=str, default = None)

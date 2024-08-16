@@ -1,0 +1,2 @@
+git problem, add safety and remove all the files and download again
+NFD problem, copy glfw3.lib to glfw.lib, modify the target lib in the CMakeLists.txt
