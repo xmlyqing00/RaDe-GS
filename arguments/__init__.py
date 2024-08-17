@@ -60,6 +60,12 @@ class ModelParams(ParamGroup):
         self.use_lap_pyramid = True
         self.lap_pyramid_level: int = 4  # 4
         self.lap_pyramid_debug: bool = False
+
+        self.tcnn_num_neurons: int = 128
+        self.tcnn_num_layers: int = 4
+        self.scene_range = 10 # for hotdog
+        self.scene_min = -5
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -78,9 +84,9 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
 
-        self.lap_level_upgrade_interval = 4000
-
-        self.iterations = self.lap_level_upgrade_interval * 4  # 4_000
+        self.lap_level_upgrade_interval = 10000
+        self.base_iterations = 4000
+        self.iterations = self.base_iterations  # 4_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -96,19 +102,19 @@ class OptimizationParams(ParamGroup):
         self.lambda_distortion = 100
         self.lambda_depth_normal = 0.05
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000 # 3000
+        self.opacity_reset_interval = self.base_iterations // 5 # 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = self.lap_level_upgrade_interval // 2 # 15_000
+        self.densify_until_iter = self.base_iterations // 2 # 15_000
         # self.regularization_from_iter = 15_000
         self.densify_grad_threshold = 0.0002 # 0.0002
 
-        
-        self.depth_opt_from_iter = self.lap_level_upgrade_interval // 2
+        self.residual_lr = 1e-2
+        self.depth_opt_from_iter = self.base_iterations // 2
         # self.union_l1loss_interval = 3_000
         self.new_gauss_view_num: int = 1
         self.new_gauss_l1loss_thres: float = 0.1
 
-        self.verbose = True
+        self.verbose = False
 
         super().__init__(parser, "Optimization Parameters")
 

@@ -114,8 +114,8 @@ class Scene:
         self.gaussians.create_from_pcd(self.scene_info.point_cloud, self.cameras_extent)
 
     
-    def add_gaussian_from_pts(self, pts_xyz_world: torch.Tensor, pts_radius: torch.Tensor, pts_color: torch.Tensor):
-        self.gaussians.create_from_pts(pts_xyz_world, pts_radius, pts_color, self.cameras_extent)
+    def add_gaussian_from_pts(self, pts_xyz_world: torch.Tensor, pts_radius: torch.Tensor, pts_color: torch.Tensor, init: bool):
+        self.gaussians.create_from_pts(pts_xyz_world, pts_radius, pts_color, self.cameras_extent, init)
 
 
     def save(self, iteration):

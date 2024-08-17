@@ -160,14 +160,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             rendered_depth = torch.nan_to_num(rendered_depth, 0, 0)
 
  
-            if True or cur_lap_level == dataset.lap_pyramid_level - 1:
+            if cur_lap_level == dataset.lap_pyramid_level - 1:
                 final_image = rendered_image
             else:
-                pass
-                # view_pkg_last = render_pkg_last[viewpoint_cam.image_name]
-                # render_fix_front = render_pkg['render'] + view_pkg_last['render'] * rendered_alpha_t # auto broadcast .repeat(3, 1, 1)
+                # pass
+                view_pkg_last = render_pkg_last[viewpoint_cam.image_name]
+                render_fix_front = render_pkg['render'] + view_pkg_last['render'] * rendered_alpha_t # auto broadcast .repeat(3, 1, 1)
                 # render_fix_back = view_pkg_last['render'] + render_pkg['render'] * view_pkg_last['alpha_t'] # auto broadcast .repeat(3, 1, 1)
                 # final_image = torch.where(view_pkg_last['depth'] > rendered_depth, render_fix_front, render_fix_back)
+                final_image = render_fix_front
                 # x = rendered_depth.view(-1) == 0
                 # rendered_image = rendered_image.view(3, -1)[:, x]
 
@@ -252,11 +253,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = rgb_loss + depth_normal_loss * lambda_depth_normal + distortion_loss * lambda_distortion
             loss.backward()
 
-            if cur_lap_level < dataset.lap_pyramid_level - 1:
-                # freeze old gaussians
-                for param_group in gaussians.optimizer.param_groups:
-                    if param_group['name'] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation']:
-                        param_group['params'][0].grad[:old_gaussian_num] = 0
+            # if cur_lap_level < dataset.lap_pyramid_level - 1:
+            #     # freeze old gaussians
+            #     for param_group in gaussians.optimizer.param_groups:
+            #         if param_group['name'] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation']:
+            #             param_group['params'][0].grad[:old_gaussian_num] = 0
 
             iter_end.record()
 
@@ -319,7 +320,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # Record result, prepare next level 
         if cur_lap_level > 0:
-            old_gaussian_num = gaussians.get_xyz.shape[0]
+            # old_gaussian_num = gaussians.get_xyz.shape[0]
 
             viewpoint_stack = scene.getTrainCameras().copy()
             if opt.verbose:
@@ -393,7 +394,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 print(f"\n[ITER {total_iter} Upscale] Evaluating Train: L1 {l1_test} PSNR {psnr_test}")
 
-                scene.add_gaussian_from_pts(pts_xyz_collection, pts_radius_collection, pts_color_collection)
+                gaussians.__init__(dataset.sh_degree)
+                scene.add_gaussian_from_pts(pts_xyz_collection, pts_radius_collection, pts_color_collection, init=True)
                 gaussians.training_setup(opt)
                 gaussians.compute_3D_filter(cameras=trainCameras)
                 
@@ -474,7 +476,18 @@ def training_report(tb_writer, iter, total_iter, lap_level, report_loss, l1_loss
                     render_image = render_result['render']
                      
                     # depth = render_result["depth"]
-                    image = torch.clamp(render_image, 0.0, 1.0)
+                    if last_pc is not None:
+                        last_render_result = render(
+                            viewpoint, 
+                            last_pc, 
+                            *renderArgs, 
+                            image_height=gt_image.shape[1], image_width=gt_image.shape[2]
+                        )
+                        last_render_image = last_render_result['render']
+                        image = torch.clamp(render_image + last_render_image * render_result['alpha_t'], 0.0, 1.0)
+                    else:
+                        image = torch.clamp(render_image, 0.0, 1.0)
+
                     # torchvision.utils.save_image(image, out_dir / f'{viewpoint.image_name}.png')
                     # torchvision.utils.save_image(gt_image, out_dir / f'{viewpoint.image_name}_gt.png')
                     if tb_writer and (idx < 5):
