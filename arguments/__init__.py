@@ -84,7 +84,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
 
-        self.lap_level_upgrade_interval = 10000
+        self.lap_level_upgrade_interval = 4000
         self.base_iterations = 4000
         self.iterations = self.base_iterations  # 4_000
         self.position_lr_init = 0.00016

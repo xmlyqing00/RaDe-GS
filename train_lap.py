@@ -424,7 +424,7 @@ def prepare_output_and_logger(args, verbose):
 
     # Create Tensorboard writer
     tb_writer = None
-    if TENSORBOARD_FOUND:
+    if False and TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
     else:
         if not TENSORBOARD_FOUND:
