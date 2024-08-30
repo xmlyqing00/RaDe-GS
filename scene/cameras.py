@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import math
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, rot_mat_to_rot_vec
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, gt_depth,
@@ -87,6 +87,7 @@ class Camera(nn.Module):
             device=self.data_device
         ).float()
         self.basic_intrins_inv = torch.inverse(basic_intrins).T
+        self.rot_vec = rot_mat_to_rot_vec(R)
 
 
 class MiniCam:

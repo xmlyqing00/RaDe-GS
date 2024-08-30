@@ -298,6 +298,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             im_data = np.array(image.convert("RGBA"))
 
+            # depth_path = image_path[:-4] + '_depth_0029.png'
+            depth = None
+            # if os.path.exists(depth_path):
+            #     depth = Image.open(depth_path).convert('L')
+            #     depth = np.array(depth)
+            #     depth = 8 * (1 - depth / 255.0)
+            #     depth = Image.fromarray(depth)
+            # else:
+            #     depth = None
+
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
 
             norm_data = im_data / 255.0
@@ -308,9 +318,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
-
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], depth=None, mask=None))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], depth=depth, mask=None))
             
     return cam_infos
 
@@ -331,7 +340,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", gap = 
     if True or not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
         if use_lap_pyramid:
-            num_pts = 1_000
+            num_pts = 10_000
         else:
             num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")

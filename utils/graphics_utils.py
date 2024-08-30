@@ -250,3 +250,35 @@ def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth
 
     return mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff
 
+
+def rot_mat_to_rot_vec(R):
+    """
+    Convert a 3x3 rotation matrix to a 3x1 rotation vector (axis-angle representation).
+    
+    Args:
+    - R: A 3x3 rotation matrix
+    
+    Returns:
+    - rotation_vector: A 3x1 rotation vector representing the rotation
+    """
+    # Ensure R is a 3x3 matrix
+    assert R.shape == (3, 3), "R must be a 3x3 matrix"
+    
+    # Compute the angle of rotation (theta)
+    theta = np.arccos((np.trace(R) - 1) / 2.0)
+    
+    # If theta is close to zero, the rotation is very small, and we can return a zero vector
+    if np.isclose(theta, np.array(0.0)):
+        return np.zeros(3)
+    
+    # Compute the rotation axis (normalized)
+    rotation_axis = np.array([
+        R[2, 1] - R[1, 2],
+        R[0, 2] - R[2, 0],
+        R[1, 0] - R[0, 1]
+    ]) / (2.0 * np.sin(theta))
+    
+    # Rotation vector is the axis multiplied by the angle
+    rotation_vector = theta * rotation_axis
+    
+    return rotation_vector

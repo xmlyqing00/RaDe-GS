@@ -58,13 +58,13 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.use_decoupled_appearance = False
         self.use_lap_pyramid = True
-        self.lap_pyramid_level: int = 4  # 4
+        self.lap_pyramid_level: int = 1  # 4
         self.lap_pyramid_debug: bool = False
 
-        self.tcnn_num_neurons: int = 128
-        self.tcnn_num_layers: int = 4
-        self.scene_range = 10 # for hotdog
-        self.scene_min = -5
+        self.tcnn_num_neurons: int = 64
+        self.tcnn_num_layers: int = 2
+        self.scene_range = 5 # for hotdog
+        self.scene_min = -self.scene_range / 2
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -84,13 +84,13 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
 
-        self.lap_level_upgrade_interval = 4000
-        self.base_iterations = 4000
+        self.lap_level_upgrade_interval = 3000
+        self.base_iterations = 3_000
         self.iterations = self.base_iterations  # 4_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = self.base_iterations
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -101,8 +101,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_distortion = 100
         self.lambda_depth_normal = 0.05
-        self.densification_interval = 100
-        self.opacity_reset_interval = self.base_iterations // 5 # 3000
+        self.densification_interval = 300
+        self.opacity_reset_interval = self.base_iterations // 4 # 3000
         self.densify_from_iter = 500
         self.densify_until_iter = self.base_iterations // 2 # 15_000
         # self.regularization_from_iter = 15_000
