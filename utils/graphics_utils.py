@@ -151,7 +151,7 @@ def depth_to_points_fast(view, depth):
     radius = depth.reshape(-1, 1) * rays_d_gap[:, 0:1]
     radius = abs(radius) * 0.707  # sqrt(2) / 2
 
-    return points, radius
+    return points, rays_d, radius
 
 
 def depth_double_to_normal(view, depth1, depth2):

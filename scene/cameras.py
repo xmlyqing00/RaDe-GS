@@ -86,6 +86,7 @@ class Camera(nn.Module):
             [0., 0., 1.0]],
             device=self.data_device
         ).float()
+        self.basic_intrins = basic_intrins.T
         self.basic_intrins_inv = torch.inverse(basic_intrins).T
         self.rot_vec = rot_mat_to_rot_vec(R)
 

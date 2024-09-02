@@ -114,7 +114,7 @@ class OptimizationParams(ParamGroup):
         self.new_gauss_view_num: int = 1
         self.new_gauss_l1loss_thres: float = 0.1
 
-        self.verbose = False
+        self.verbose = True
 
         super().__init__(parser, "Optimization Parameters")
 
