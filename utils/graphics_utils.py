@@ -265,7 +265,9 @@ def rot_mat_to_rot_vec(R):
     assert R.shape == (3, 3), "R must be a 3x3 matrix"
     
     # Compute the angle of rotation (theta)
-    theta = np.arccos((np.trace(R) - 1) / 2.0)
+    a = (np.trace(R) - 1) / 2.0
+    a = max(-1, min(a, 1.0))
+    theta = np.arccos(a)
     
     # If theta is close to zero, the rotation is very small, and we can return a zero vector
     if np.isclose(theta, np.array(0.0)):

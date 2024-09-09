@@ -15,11 +15,11 @@ import os
 
 import torch
 import cv2
-from torch.nn.functional import grid_sample
+from torch.nn.functional import grid_sample, pad    
 import trimesh
 import datetime
 import tinycudann as tcnn
-from random import randint, shuffle
+from random import randint, shuffle, choice
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -73,8 +73,6 @@ def L1_loss_appearance(image, gt_image, gaussians, view_idx, return_transformed_
     else:
         transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
         return transformed_image
-
-
 
 def get_residual_image(
         view, 
@@ -139,44 +137,103 @@ def get_residual_image(
             torchvision.utils.save_image(render_pkg['residual_image'], level_result_dir / f'{view.image_name}_residual.png')
 
 
-def get_pts_xyz_corrected_depth_offset(view, render_pkg_last, pos_offset_model):
+def get_pts_xyz_corrected_depth_offset(view, render_pkg, pos_encoding, pos_network, return_depth_map: bool = True):
+    # ray view to world
+    # rays_d_homo = torch.concat([render_pkg['rays_d'] , torch.ones_like(render_pkg['rays_d'][:, 0:1])], dim=-1)
+    # rays_d_world = rays_d_homo @ view.world_view_transform_inv
+    
     # compute depth offset
-    pts_xyz_normalized = render_pkg_last[view.image_name]['pts_xyz_world_normalized']
-    d_offset = pos_offset_model(pts_xyz_normalized).float()
+    pts_xyz_normalized = render_pkg['pts_xyz_world_normalized']
+    pts_encoding = pos_encoding(pts_xyz_normalized)
+    pts_input = torch.concat([pts_xyz_normalized, pts_encoding], dim=-1)
+    d_offset = pos_network(pts_input).float()
 
     # depth to view
-    depth_corrected = render_pkg_last[view.image_name]['pts_depth'] + d_offset
+    depth_corrected = render_pkg['pts_depth'] + d_offset
     depth_corrected = torch.clamp(depth_corrected, 0, None)
-    pts_xyz_corrected = render_pkg_last[view.image_name]['rays_d'] * depth_corrected
+    pts_xyz_corrected = render_pkg['rays_d'] * depth_corrected
 
     # view to world
     corrected_homo = torch.concat([pts_xyz_corrected, torch.ones_like(pts_xyz_corrected[:, 0:1])], dim=-1)
     pts_xyz_world = corrected_homo @ view.world_view_transform_inv
+
     
-    return pts_xyz_world
+
+    # update the depth map
+    if return_depth_map:
+        depth_map = render_pkg['depth'].clone().reshape(-1, 1)
+        depth_map[render_pkg['pts_mask']] = depth_corrected
+        depth_map = depth_map.reshape(*render_pkg['depth'].shape)
+        
+        # patch xyz
+        # offsets = [(i, j) for i in range(-2, 3) for j in range(-2, 3)]
+        # padded_depth = pad(depth_map, (2, 2, 2, 2), mode='reflect')  # shape (3, H+4, W+4)
+        # H, W = depth_map.shape[1], depth_map.shape[2]
+        # features = []
+        # for dy, dx in offsets:
+        #     # Shift the image to access neighbors
+        #     neighbor = padded_depth[:, 2+dy:H+2+dy, 2+dx:W+2+dx]
+        #     features.append(neighbor)
+        # depth_map_patch = torch.stack(features, dim=-1)
+
+        return pts_xyz_world, depth_map
+    else:
+        return pts_xyz_world, None
 
 
-# def render_image(
-#         view, 
-#         pos_offset_model: tcnn.NetworkWithInputEncoding,
-#         # residual_model: tcnn.NetworkWithInputEncoding, 
-#         render_pkg_last: dict, 
-#         gt_image: torch.Tensor, 
-#         level_result_dir: Path,
-#         verbose: bool
-#     ):
+def loss_in_neighbor_view(
+        pts_homo: torch.Tensor, view_neighbor: Camera, 
+        depth_map_neighbor: torch.Tensor, 
+        color_map_neighbor: torch.Tensor,
+        pts_colors: torch.Tensor,
+        depth_valid_threshold: float,
+    ):
+    pts_homo_proj = pts_homo @ view_neighbor.world_view_transform
+    proj_uvw = pts_homo_proj[:, :3] @ view_neighbor.intrins
+    proj_depth = proj_uvw[:, 2:3]
+    proj_uv = proj_uvw / proj_depth
+    proj_uv[:, 0] = proj_uv[:, 0] / (view_neighbor.image_width-1) * 2 - 1
+    proj_uv[:, 1] = proj_uv[:, 1] / (view_neighbor.image_height-1) * 2 - 1
+    proj_uv = proj_uv[:, :2].reshape(1, -1, 1, 2)
 
-#     pts_xyz_normalized = render_pkg_last[view.image_name]['pts_xyz_world_normalized']
-#     # residual_color = torch.zeros_like(render_pkg_last[view.image_name]['render'])
+    sampled_depth = grid_sample(
+        depth_map_neighbor.unsqueeze(1), 
+        proj_uv, mode='bilinear', align_corners=True
+    ).squeeze()
 
-#     # pts_xyz_corrected = pts_xyz_normalized + pos_offset_model(pts_xyz_normalized).float()
-#     pts_xyz_corrected = pts_xyz_normalized
-#     residual_color_pts = residual_model(pts_xyz_corrected).float()
-#     residual_color.view(3, -1)[:, render_pkg_last[view.image_name]['pts_mask']] = residual_color_pts.permute(1, 0)
-#     # final_image = render_pkg_last[view.image_name]['render'] + residual_color
-#     final_image = residual_color
+    if color_map_neighbor is not None:
+        sampled_color = grid_sample(
+            color_map_neighbor, 
+            proj_uv, mode='bilinear', align_corners=True
+        ).squeeze().permute(1, 0)
 
-#     return final_image
+    diff_depth = sampled_depth - proj_depth.squeeze(1)
+    valid_mask = torch.abs(diff_depth) < depth_valid_threshold
+    loss = diff_depth[valid_mask].abs().mean()
+
+    if color_map_neighbor is not None:
+        loss_color = (sampled_color - pts_colors)[valid_mask].abs().mean()
+
+    return loss, loss_color
+
+
+def render_image_with_residual(
+        view, 
+        pos_encoding, pos_network, 
+        residual_encoding, residual_network, 
+        render_pkg: dict, 
+    ):
+
+    pts_xyz_world, _ = get_pts_xyz_corrected_depth_offset(view, render_pkg, pos_encoding, pos_network, return_depth_map=False)
+    pts_xyz = pts_xyz_world[:, :3]
+    pts_encoding = residual_encoding(pts_xyz).float()
+    pts_input = torch.concat([pts_xyz, pts_encoding], dim=-1)
+    residual_color_pts = residual_network(pts_input).float()
+    final_image = render_pkg['render'].clone().view(3, -1)
+    final_image[:, render_pkg['pts_mask']] += residual_color_pts.permute(1, 0)
+    final_image = final_image.view(3, *render_pkg['render'].shape[1:])
+
+    return final_image
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
@@ -204,14 +261,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     total_iter = 0
         
-    config_hashgrid = {
+    config_tcnn = {
         'encoding': {
             'otype': 'HashGrid',
             'n_levels': 16,  # 16
             'n_features_per_level': 2,
             'log2_hashmap_size': 19, # 19
             'base_resolution': 16,
-            'per_level_scale': 2, # 2.0
+            'per_level_scale': 1.4, # 2.0
             'interpolation': 'Smoothstep'
         },
         'network': {
@@ -234,7 +291,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         checkpoint = Path(checkpoint)
         if checkpoint.exists():
             print(f"Loading checkpoint {checkpoint}")
-            base_material = pickle.load(open(checkpoint / 'base_material.pkl', "rb"))
+            saved_dict = pickle.load(open(checkpoint / 'base_material.pkl', "rb"))
+            base_material = saved_dict['base_materical']
+            render_pkg_last_train = saved_dict['render_pkg_last_train']
+            render_pkg_last_test = saved_dict['render_pkg_last_test']
+            train_view_pairs = saved_dict['train_view_pairs']
             (model_params, first_iter) = torch.load(checkpoint / 'chkpnt3000.pth')
             gaussians.restore(model_params, opt)
             gaussians.compute_3D_filter(cameras=trainCameras)
@@ -433,353 +494,406 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
                     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
         
-        # Record result, prepare next level 
         base_material = (pipe, background, dataset.scene_min, dataset.scene_range)
-        pickle.dump(base_material, open(scene.model_path + "/base_material.pkl", "wb"))
+            
+        # Residual Training
+        for cur_lap_level in range(max(0, dataset.lap_pyramid_level - 2), -1, -1):
+            print('Getting residual image from train cameras')
+            # Get residual image
+            training_views = scene.getTrainCameras().copy()
+            if training_views and len(training_views) > 0:
+                render_pkg_last_train = {}
+                for view in training_views:
+                    get_residual_image(
+                        view, 
+                        gaussians, 
+                        base_material, 
+                        render_pkg_last_train, 
+                        view.gauss_pyramid[cur_lap_level].squeeze(0), 
+                        Path(scene.model_path) / f'level_{cur_lap_level}',
+                        opt.verbose
+                    )
+            else:
+                render_pkg_last_train = None
+            print('Getting residual image from test cameras')
+            testing_views = scene.getTestCameras().copy()
+            if testing_views and len(testing_views) > 0:
+                render_pkg_last_test = {}
+                for view in testing_views:
+                    get_residual_image(
+                        view, 
+                        gaussians, 
+                        base_material, 
+                        render_pkg_last_test, 
+                        view.gauss_pyramid[cur_lap_level].squeeze(0), 
+                        Path(scene.model_path) / f'level_{cur_lap_level}',
+                        opt.verbose
+                    )
+            else:
+                render_pkg_last_test = None
+
+            # collect neighboring cameras for training
+            print('Collecting neighboring cameras for training')
+            viewpoint_stack = scene.getTrainCameras().copy()
+            view_num = len(viewpoint_stack)
+            view_dist = np.zeros((view_num, view_num))
+
+            with torch.no_grad():
+                for view_idx1 in range(view_num):
+                    
+                    view1 = viewpoint_stack[view_idx1]
+
+                    for view_idx2 in range(view_idx1 + 1, view_num):
+                        
+                        view2 = viewpoint_stack[view_idx2]
+                        rot_dist = np.linalg.norm(view1.rot_vec - view2.rot_vec)
+                        trans_dist = np.linalg.norm(view1.T - view2.T)
+                        view_dist[view_idx1, view_idx2] = rot_dist + trans_dist
+                        view_dist[view_idx2, view_idx1] = view_dist[view_idx1, view_idx2]
+
+            train_view_pairs = []
+            neighbor_num = 3
+            for view_idx1 in range(view_num):
+
+                neighbor_idx = np.argsort(view_dist[view_idx1])
+                train_view_pairs.append((view_idx1, *neighbor_idx[1:1 + neighbor_num]))
+            
+            # print(train_view_pairs)
+            # Record result, prepare next level 
+            pickle.dump(
+                {
+                    'base_materical': base_material, 
+                    'render_pkg_last_train': render_pkg_last_train, 
+                    'render_pkg_last_test': render_pkg_last_test,
+                    'train_view_pairs': train_view_pairs
+                }, 
+                open(scene.model_path + "/base_material.pkl", "wb")
+            )
+
+    pos_encoding = tcnn.Encoding(3, config_tcnn['encoding'])
+    pos_network = tcnn.Network(3+pos_encoding.n_output_dims, 1, config_tcnn['network'])
+
+    residual_opt = torch.optim.AdamW([
+        {'params': pos_encoding.parameters()},
+        {'params': pos_network.parameters()}
+    ], lr=opt.residual_lr)
+    residual_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        residual_opt, T_max=opt.lap_level_upgrade_interval
+    )
+    residual_opt.zero_grad(set_to_none = True)
     
-    # Residual Training
-    for cur_lap_level in range(max(0, dataset.lap_pyramid_level - 2), -1, -1):
+    level_result_dir = Path(scene.model_path) / f'depth_{cur_lap_level}'
+    level_result_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get residual image
-        training_views = scene.getTrainCameras().copy()
-        if training_views and len(training_views) > 0:
-            render_pkg_last_train = {}
-            for view in training_views:
-                get_residual_image(
-                    view, 
-                    gaussians, 
-                    base_material, 
-                    render_pkg_last_train, 
-                    view.gauss_pyramid[cur_lap_level].squeeze(0), 
-                    Path(scene.model_path) / f'level_{cur_lap_level}',
-                    opt.verbose
-                )
-        else:
-            render_pkg_last_train = None
+    print(f"Training depth {cur_lap_level}")
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(1, opt.lap_level_upgrade_interval + 1), desc="Training progress")
 
-        testing_views = scene.getTestCameras().copy()
-        if testing_views and len(testing_views) > 0:
-            render_pkg_last_test = {}
-            for view in testing_views:
-                get_residual_image(
-                    view, 
-                    gaussians, 
-                    base_material, 
-                    render_pkg_last_test, 
-                    view.gauss_pyramid[cur_lap_level].squeeze(0), 
-                    Path(scene.model_path) / f'level_{cur_lap_level}',
-                    opt.verbose
-                )
-        else:
-            render_pkg_last_test = None
+    train_view_pairs_stack = None
+    training_views = scene.getTrainCameras().copy()
 
-        # collect neighboring cameras for training
-        viewpoint_stack = scene.getTrainCameras().copy()
-        view_num = len(viewpoint_stack)
-        view_dist = np.zeros((view_num, view_num))
+    if opt.verbose:
+        train_depth_dir = Path(scene.model_path) / 'train_depth_verbose'
+        train_depth_dir.mkdir(parents=True, exist_ok=True)
+
+    for iteration in range(1, opt.lap_level_upgrade_interval + 1):
+
+        total_iter += 1
+
+        if not train_view_pairs_stack:
+            train_view_pairs_stack = train_view_pairs.copy()
+            # shuffle(train_view_pairs_stack)
+        view_pair = train_view_pairs_stack.pop()
+        # view_pair = train_view_pairs_stack[5]
+
+        view_cur = training_views[view_pair[0]]
+        view_neighbor = training_views[choice(view_pair[1:])]
+        # view_neighbor = training_views[view_pair[1]]
+
+        W, H = view_cur.image_width, view_cur.image_height
+        pts_xyz_corrected_cur, depth_map_cur = get_pts_xyz_corrected_depth_offset(view_cur, render_pkg_last_train[view_cur.image_name], pos_encoding, pos_network)
+        pts_xyz_corrected_neighbor, depth_map_neighbor = get_pts_xyz_corrected_depth_offset(view_neighbor, render_pkg_last_train[view_neighbor.image_name], pos_encoding, pos_network)
+        # pts_xyz_color = render_pkg_last_train[view_cur.image_name]['pts_color']
+        pts_xyz_color_cur = view_cur.gray_patch_feat.reshape(25, -1).permute(1, 0)[render_pkg_last_train[view_cur.image_name]['pts_mask']]
+        pts_xyz_color_neighbor = view_neighbor.gray_patch_feat.reshape(25, -1).permute(1, 0)[render_pkg_last_train[view_neighbor.image_name]['pts_mask']]
+        # pts_xyz_residual_color = render_pkg_last_train[view.image_name]['pts_residual_color']
+
+        loss_depth, loss_color = loss_in_neighbor_view(
+            pts_xyz_corrected_cur, view_neighbor, 
+            depth_map_neighbor, 
+            view_neighbor.gray_patch_feat, pts_xyz_color_cur,
+            opt.depth_valid_threshold,
+        )
+
+        loss_depth2, loss_color2 = loss_in_neighbor_view(
+            pts_xyz_corrected_neighbor, view_cur, 
+            depth_map_cur, 
+            view_cur.gray_patch_feat, pts_xyz_color_neighbor,
+            opt.depth_valid_threshold,
+        )
+        # loss2 = depth_loss_in_neighbor_view(pts_xyz_corrected_neighbor, view_cur, depth_map_cur, opt.depth_valid_threshold)
+        loss = loss_depth + loss_color + loss_depth2 + loss_color2
+        # loss = loss_depth2 + loss_depth
+
+        # if iteration > 1000 and loss_depth.item() > 0.05:
+            # print(iteration, view_cur.image_name, view_neighbor.image_name)
+
+        # if False:
+        #     torchvision.utils.save_image(
+        #         render_pkg_last_train[view_neighbor.image_name]['depth'][0] / 6, 
+        #         level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_view_depth.png'
+        #     )
+        #     proj_depth_img = np.zeros((H, W), dtype=np.uint8)
+        #     sampled_depth_img = np.zeros((H, W), dtype=np.uint8)
+        #     diff_depth_img = np.zeros((H, W), dtype=np.uint8)
+        #     for i in range(proj_uv.shape[1]):
+        #         u, v = proj_uv[0, i, 0].tolist()
+        #         u = int((u + 1) / 2 * W)
+        #         v = int((v + 1) / 2 * H)
+        #         if 0 <= u < W and 0 <= v < H:
+        #             proj_depth_img[v, u] = int(proj_depth[i].item() / 6.0 * 255)
+        #             sampled_depth_img[v, u] = int(sampled_depth[0, 0, i].item() / 6.0 * 255)
+        #             diff_depth_img[v, u] = np.clip(int(abs(proj_depth[i].item() - sampled_depth[0, 0, i].item()) * 255), 0, 255)
+
+        #     cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_proj_depth.png', proj_depth_img)
+        #     cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_sampled_depth.png', sampled_depth_img)
+        #     cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_diff_depth.png', diff_depth_img)
+        
+        # sampled_color = grid_sample(
+        #     view_neighbor.gauss_pyramid[cur_lap_level],
+        #     proj_uv, mode='bilinear', align_corners=True
+        # )
+        # sampled_residual_color = grid_sample(
+        #     render_pkg_last_train[view_neighbor.image_name]['residual_image'].unsqueeze(0), 
+        #     proj_uv, mode='bilinear', align_corners=True
+        # )
+
+        # valid_mask = abs(sampled_depth - proj_depth).squeeze() < 0.3
+        # loss_neighbor_color += l1_loss(sampled_color.squeeze().permute(1, 0)[valid_mask], pts_xyz_color[valid_mask])
+        # loss_neighbor_residual_color += l1_loss(sampled_residual_color.squeeze().permute(1, 0)[valid_mask], pts_xyz_residual_color[valid_mask])
+
+        
+
+        # loss = loss_neighbor_color + loss_neighbor_residual_color
+        # loss = loss_neighbor_color
+        loss.backward()
+
+        # residual_opt.step()
+        residual_opt.zero_grad(set_to_none = True)
+        residual_scheduler.step()
 
         with torch.no_grad():
-            for view_idx1 in range(view_num):
-                
-                view1 = viewpoint_stack[view_idx1]
-
-                for view_idx2 in range(view_idx1 + 1, view_num):
-                    
-                    view2 = viewpoint_stack[view_idx2]
-                    rot_dist = np.linalg.norm(view1.rot_vec - view2.rot_vec)
-                    trans_dist = np.linalg.norm(view1.T - view2.T)
-                    view_dist[view_idx1, view_idx2] = rot_dist + trans_dist
-                    view_dist[view_idx2, view_idx1] = view_dist[view_idx1, view_idx2]
-
-        train_view_pairs = []
-        neighbor_num = 3
-        for view_idx1 in range(view_num):
-
-            neighbor_idx = np.argsort(view_dist[view_idx1])
-            train_view_pairs.append((view_idx1, *neighbor_idx[1:1 + neighbor_num]))
-        
-        print(train_view_pairs)
-
-        pos_offset_model = tcnn.NetworkWithInputEncoding(
-            n_input_dims, 1,
-            config_hashgrid['encoding'], config_hashgrid['network']
-        ).cuda()
-        # residual_model = tcnn.NetworkWithInputEncoding(
-        #     n_input_dims, n_output_dims,
-        #     config_hashgrid['encoding'], config_hashgrid['network']
-        # ).cuda()
-
-        residual_opt = torch.optim.Adam(pos_offset_model.parameters(), lr=opt.residual_lr)
-        residual_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            residual_opt, T_max=opt.lap_level_upgrade_interval
-        )
-        residual_opt.zero_grad(set_to_none = True)
-        
-        render_pkg_last = {}
-        level_result_dir = Path(scene.model_path) / f'level_{cur_lap_level}'
-        level_result_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"Training level {cur_lap_level}")
-        ema_loss_for_log = 0.0
-        progress_bar = tqdm(range(1, opt.lap_level_upgrade_interval + 1), desc="Training progress")
-
-        train_view_pairs_stack = None
-
-        for iteration in range(1, opt.lap_level_upgrade_interval + 1):
-
-            total_iter += 1
-
-            # Pick a random Camera
-            # if not viewpoint_stack:
-            #     viewpoint_stack = scene.getTrainCameras().copy()
-            #     shuffle(viewpoint_stack)
-            
-            # if iteration == 1 or iteration % 10 == 0:
-            # view = viewpoint_stack.pop()
-            # view = viewpoint_stack[0]
-
-            if not train_view_pairs_stack:
-                train_view_pairs_stack = train_view_pairs.copy()
-                shuffle(train_view_pairs_stack)
-            view_pair = train_view_pairs_stack.pop()
-            view = training_views[view_pair[0]]
-            view_neighbors = [training_views[idx] for idx in view_pair[1:]]
-
-            gt_image = view.gauss_pyramid[cur_lap_level].squeeze(0)
-            W, H = gt_image.shape[1:]
-            pts_xyz_corrected = get_pts_xyz_corrected_depth_offset(view, render_pkg_last_train, pos_offset_model)
-            pts_xyz_color = render_pkg_last_train[view.image_name]['pts_color']
-            pts_xyz_residual_color = render_pkg_last_train[view.image_name]['pts_residual_color']
-
-            loss_neighbor_color = 0
-            loss_neighbor_residual_color = 0
-            for view_neighbor in view_neighbors:
-                pts_xyz_corrected_proj = pts_xyz_corrected @ view_neighbor.world_view_transform
-
-                intrins = view.basic_intrins.clone()
-                intrins[:, 0] *= W
-                intrins[:, 1] *= H
-                proj_uvw = pts_xyz_corrected_proj[:, :3] @ intrins
-                proj_depth = proj_uvw[:, 2:3]
-                proj_uv = proj_uvw[:, :2] / proj_uvw[:, 2:3]
-                
-                proj_uv[:, 0] = proj_uv[:, 0] / W * 2 - 1
-                proj_uv[:, 1] = proj_uv[:, 1] / H * 2 - 1
-                proj_uv = proj_uv.reshape(1, -1, 1, 2)
-
-                sampled_depth = grid_sample(
-                    render_pkg_last_train[view_neighbor.image_name]['depth'].unsqueeze(0), 
-                    proj_uv, mode='bilinear', align_corners=True
-                )
-                
-                if False:
-                    torchvision.utils.save_image(
-                        render_pkg_last_train[view_neighbor.image_name]['depth'][0] / 6, 
-                        level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_view_depth.png'
-                    )
-                    proj_depth_img = np.zeros((H, W), dtype=np.uint8)
-                    sampled_depth_img = np.zeros((H, W), dtype=np.uint8)
-                    diff_depth_img = np.zeros((H, W), dtype=np.uint8)
-                    for i in range(proj_uv.shape[1]):
-                        u, v = proj_uv[0, i, 0].tolist()
-                        u = int((u + 1) / 2 * W)
-                        v = int((v + 1) / 2 * H)
-                        if 0 <= u < W and 0 <= v < H:
-                            proj_depth_img[v, u] = int(proj_depth[i].item() / 6.0 * 255)
-                            sampled_depth_img[v, u] = int(sampled_depth[0, 0, i].item() / 6.0 * 255)
-                            diff_depth_img[v, u] = np.clip(int(abs(proj_depth[i].item() - sampled_depth[0, 0, i].item()) * 255), 0, 255)
-
-                    cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_proj_depth.png', proj_depth_img)
-                    cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_sampled_depth.png', sampled_depth_img)
-                    cv2.imwrite(level_result_dir / f'{view.image_name}_{view_neighbor.image_name}_diff_depth.png', diff_depth_img)
-                
-                sampled_color = grid_sample(
-                    view_neighbor.gauss_pyramid[cur_lap_level],
-                    proj_uv, mode='bilinear', align_corners=True
-                )
-                sampled_residual_color = grid_sample(
-                    render_pkg_last_train[view_neighbor.image_name]['residual_image'].unsqueeze(0), 
-                    proj_uv, mode='bilinear', align_corners=True
-                )
-
-                valid_mask = abs(sampled_depth - proj_depth).squeeze() < 0.3
-                loss_neighbor_color += l1_loss(sampled_color.squeeze().permute(1, 0)[valid_mask], pts_xyz_color[valid_mask])
-                loss_neighbor_residual_color += l1_loss(sampled_residual_color.squeeze().permute(1, 0)[valid_mask], pts_xyz_residual_color[valid_mask])
-
-            loss = loss_neighbor_color + loss_neighbor_residual_color
-            # loss = loss_neighbor_color
-            loss.backward()
-
-            # final_image = render_image(
-            #     view, 
-            #     gaussians, 
-            #     base_material, 
-            #     pos_offset_model, 
-            #     residual_model, 
-            #     render_pkg_last, 
-            #     gt_image, 
-            #     level_result_dir, 
-            #     opt.verbose
-            # )
-
-            # if dataset.use_decoupled_appearance:
-            #     Ll1_render = L1_loss_appearance(final_image, gt_image, gaussians, viewpoint_cam.uid)
-            # else:
-            #     Ll1_render = l1_loss(final_image, gt_image)
-
-            # ssim_loss = ssim(final_image, gt_image.unsqueeze(0))
-            # rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim_loss)
-            # loss = rgb_loss
-            # loss.backward()
-
-            residual_opt.step()
-            residual_opt.zero_grad(set_to_none = True)
-            residual_scheduler.step()
-
-            with torch.no_grad():
-                if iteration % 10 == 0:
-                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                    progress_bar.set_postfix({
-                        "loss": f"{ema_loss_for_log:.{4}f}",
-                        'color': f"{loss_neighbor_color.item():.{4}f}",
-                        'res_color': f"{loss_neighbor_residual_color.item():.{4}f}"
-                    })
-                    progress_bar.update(10)
-
-                    if tb_writer:
-                        tb_writer.add_scalar('train_depth/total_loss', loss.item(), total_iter)
-                        tb_writer.add_scalar('train_depth/neighbor_color_loss', loss_neighbor_color.item(), total_iter)
-                        tb_writer.add_scalar('train_depth/neighbor_residual_color_loss', loss_neighbor_residual_color.item(), total_iter)
-                        tb_writer.add_scalar('scene/lr_tcnn_depth', residual_opt.param_groups[0]['lr'], total_iter)
-
-                if iteration in testing_iterations or iteration == opt.lap_level_upgrade_interval:
-                    print('\n[ITER {}] Evaluating'.format(total_iter))
-
-                    with torch.no_grad():
-                        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras(), 'render_pkg': render_pkg_last_test}, 
-                                            {'name': 'train', 'cameras' : scene.getTrainCameras(), 'render_pkg': render_pkg_last_train})
-
-                        for config in validation_configs:
-                            test_result_dir = Path(scene.model_path) / f'test_depth_{total_iter:05d}_{config["name"]}'
-                            test_result_dir.mkdir(parents=True, exist_ok=True)
-                            test_render_pkg_last = {}
-                            if not config['cameras'] or len(config['cameras']) == 0:
-                                continue
-
-                            for idx, view in enumerate(config['cameras']):
-                                pts_xyz_normalized = config['render_pkg'][view.image_name]['pts_xyz_world_normalized']
-                                d_offset = pos_offset_model(pts_xyz_normalized).float()
-
-                                # depth to view
-                                depth_corrected = config['render_pkg'][view.image_name]['pts_depth'] + d_offset
-                                depth_corrected = torch.clamp(depth_corrected, 0, None)
-                                # print(idx, view.image_name)
-
-                                if True:
-                                    depth_img = torch.zeros((H * W), dtype=torch.float32, device="cuda")
-                                    depth_img[config['render_pkg'][view.image_name]['pts_mask']] = (d_offset.squeeze() + 0.5) * 255
-                                    depth_img = torch.clamp(depth_img, 0, 255)
-                                    colormap = colormaps.get_cmap('viridis')
-                                    colormap = torch.tensor(colormap.colors).to(depth_img.device)  # type: ignore
-                                    depth_color_img = colormap[depth_img.long()]
-                                    depth_color_img = depth_color_img.reshape(H, W, -1).permute(2, 0, 1)
-                                    torchvision.utils.save_image(depth_color_img, test_result_dir / f'{view.image_name}_offset.png')
-
-                                    depth_img = torch.zeros((H * W), dtype=torch.float32, device="cuda")
-                                    depth_img[config['render_pkg'][view.image_name]['pts_mask']] = depth_corrected.squeeze() / 6
-                                    depth_img = depth_img.reshape(1, H, W)
-                                    torchvision.utils.save_image(depth_img, test_result_dir / f'{view.image_name}_depth_corrected.png')
-
-                        
-            continue
-
-            with torch.no_grad():
-                psnr_val = psnr(final_image, gt_image).mean()
-
+            if iteration % 10 == 0:
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
-                if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}"})
-                    progress_bar.update(10)
-
-                if tb_writer:
-                    tb_writer.add_scalar('train/l1_loss', Ll1_render.item(), total_iter)
-                    tb_writer.add_scalar('train/total_loss', loss.item(), total_iter)
-                    tb_writer.add_scalar('train/psnr', psnr_val.item(), total_iter)
-                    tb_writer.add_scalar('train/ssim', ssim_loss.item(), total_iter)
-                    tb_writer.add_scalar('scene/lr_tcnn', residual_opt.param_groups[0]['lr'], total_iter)
+                progress_bar.set_postfix({
+                    "loss": f"{ema_loss_for_log:.{4}f}",
+                    # 'color': f"{loss_neighbor_color.item():.{4}f}",
+                    # 'res_color': f"{loss_neighbor_residual_color.item():.{4}f}"
+                })
+                progress_bar.update(10)
 
                 if opt.verbose:
-                    base_color = render_pkg_last[view.image_name]['render']
-                    residual_color = final_image - base_color
-                    loss_map = torch.abs(final_image - gt_image).sum(dim=0)
-                    torchvision.utils.save_image(loss_map, out_dir / f'{total_iter}_l1loss.png')
-                    torchvision.utils.save_image(residual_color, out_dir / f'{total_iter}_residual_color.png')
-                    torchvision.utils.save_image(final_image, out_dir / f'{total_iter}_final.png')
-                    torchvision.utils.save_image(gt_image, out_dir / f'{total_iter}_gt.png')
-                    torchvision.utils.save_image(base_color, out_dir / f'{total_iter}_base.png')
+                    torchvision.utils.save_image(view_cur.original_image, train_depth_dir / f'{iteration}_cur_{view_cur.image_name}_gt.png')
+                    torchvision.utils.save_image(view_neighbor.original_image, train_depth_dir / f'{iteration}_neighbor_{view_neighbor.image_name}_gt.png')
+                    torchvision.utils.save_image((depth_map_cur - 3) / 3, train_depth_dir / f'{iteration}_cur_{view_cur.image_name}_depth.png')
+                    torchvision.utils.save_image((depth_map_neighbor - 3) / 3, train_depth_dir / f'{iteration}_neighbor_{view_neighbor.image_name}_depth.png')
 
-                if iteration in testing_iterations or iteration == opt.lap_level_upgrade_interval:
-                    print('\n[ITER {}] Evaluating'.format(total_iter))
-                    pos_offset_model.eval()
-                    residual_model.eval()
 
-                    torch.cuda.empty_cache()
-                    validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                                        {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(0, len(scene.getTrainCameras()), 2)]})
+                if tb_writer:
+                    tb_writer.add_scalar('train_depth/total_loss', loss.item(), total_iter)
+                    # print(loss_depth.item(), loss_color.item())
+                    tb_writer.add_scalar('train_depth/depth_loss', loss_depth.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/color_loss', loss_color.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/depth_loss2', loss_depth2.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/color_loss2', loss_color2.item(), total_iter)
+                    # tb_writer.add_scalar('train_depth/neighbor_color_loss', loss_neighbor_color.item(), total_iter)
+                    # tb_writer.add_scalar('train_depth/neighbor_residual_color_loss', loss_neighbor_residual_color.item(), total_iter)
+                    tb_writer.add_scalar('scene/lr_tcnn_depth', residual_opt.param_groups[0]['lr'], total_iter)
 
-                    for config in validation_configs:
-                        test_result_dir = Path(scene.model_path) / f'test_{total_iter:05d}_{config["name"]}'
-                        test_result_dir.mkdir(parents=True, exist_ok=True)
-                        test_render_pkg_last = {}
-                        if config['cameras'] and len(config['cameras']) > 0:
-                            l1_test = 0.0
-                            psnr_test = 0.0
-                            for idx, test_view in enumerate(config['cameras']):
-                                # print(config['name'], test_view.image_name)
-                                test_gt_image = torch.clamp(test_view.gauss_pyramid[cur_lap_level], 0.0, 1.0)[0]
-                                render_result = render_image(
-                                    test_view, 
-                                    gaussians,
-                                    base_material, 
-                                    pos_offset_model,
-                                    residual_model, 
-                                    test_render_pkg_last, 
-                                    test_gt_image, 
-                                    test_result_dir, 
-                                    False
-                                )
-                                if tb_writer and (idx < 5):
-                                    tb_writer.add_images(config['name'] + "_v iew_{}/render".format(test_view.image_name), render_result[None], global_step=total_iter)
-                                    tb_writer.add_images(config['name'] + "_view_{}/residual".format(test_view.image_name), residual_color[None], global_step=total_iter)
-                                    # if iteration == testing_iterations[0]:
-                                    tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(test_view.image_name), test_gt_image[None], global_step=total_iter)
-                                l1_test += l1_loss(render_result, test_gt_image).mean().double()
-                                psnr_test += psnr(render_result, test_gt_image).mean().double()
+            if iteration in testing_iterations or iteration == opt.lap_level_upgrade_interval or iteration == 1:
+                print('\n[ITER {}] Depth Evaluating'.format(total_iter))
 
-                                if True:
-                                    base_color = test_render_pkg_last[test_view.image_name]['render']
-                                    residual_color = render_result - base_color
-                                    torchvision.utils.save_image(residual_color, test_result_dir / f'{test_view.image_name}_residual.png')
-                                    torchvision.utils.save_image(render_result, test_result_dir / f'{test_view.image_name}_render.png')
-                                    torchvision.utils.save_image(test_gt_image, test_result_dir / f'{test_view.image_name}_gt.png')
-                                    torchvision.utils.save_image(base_color, test_result_dir / f'{test_view.image_name}_base.png')
-                            psnr_test /= len(config['cameras'])
-                            l1_test /= len(config['cameras'])          
-                            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(total_iter, config['name'], l1_test, psnr_test))
-                            if config["name"] == "test":
-                                with open(scene.model_path + "/chkpnt" + str(total_iter) + ".txt", "w") as file_object:
-                                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(total_iter, config['name'], l1_test, psnr_test), file=file_object)
-                            if tb_writer:
-                                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, total_iter)
-                                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, total_iter)
+                validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras(), 'render_pkg': render_pkg_last_test}, 
+                                    {'name': 'train', 'cameras' : scene.getTrainCameras(), 'render_pkg': render_pkg_last_train})
 
-                    torch.cuda.empty_cache()
-                    pos_offset_model.train()
-                    residual_model.train()
+                for config in validation_configs:
+                    test_result_dir = Path(scene.model_path) / f'test_depth_{total_iter:05d}_{config["name"]}'
+                    test_result_dir.mkdir(parents=True, exist_ok=True)
+                    if not config['cameras'] or len(config['cameras']) == 0:
+                        continue
 
-        progress_bar.close()
+                    for idx, view in enumerate(config['cameras']):
+                        # rays_d = config['render_pkg'][view.image_name]['rays_d']
+                        # rays_d_homo = torch.concat([rays_d, torch.ones_like(rays_d[:, 0:1])], dim=-1)
+                        # rays_d_world = rays_d_homo @ view.world_view_transform_inv
 
+                        pts_xyz_normalized = config['render_pkg'][view.image_name]['pts_xyz_world_normalized']
+                        pts_encoding = pos_encoding(pts_xyz_normalized)
+                        pts_input = torch.concat([pts_xyz_normalized, pts_encoding], dim=-1)
+                        d_offset = pos_network(pts_input).float()
+
+                        # depth to view
+                        depth_corrected = config['render_pkg'][view.image_name]['pts_depth'] + d_offset
+                        depth_corrected = torch.clamp(depth_corrected, 0, None)
+                        # print(idx, view.image_name)
+
+                        if opt.verbose:
+                            depth_img = torch.zeros((H * W), dtype=torch.float32, device="cuda")
+                            depth_img[config['render_pkg'][view.image_name]['pts_mask']] = (d_offset.squeeze() + 0.5) * 255
+                            depth_img = torch.clamp(depth_img.long(), 0, 255)
+                            colormap = colormaps.get_cmap('viridis')
+                            colormap = torch.tensor(colormap.colors).to(depth_img.device)  # type: ignore
+                            depth_color_img = colormap[depth_img]
+                            depth_color_img = depth_color_img.reshape(H, W, -1).permute(2, 0, 1)
+                            torchvision.utils.save_image(depth_color_img, test_result_dir / f'{view.image_name}_offset.png')
+
+                            depth_img = torch.zeros((H * W), dtype=torch.float32, device="cuda")
+                            depth_img[config['render_pkg'][view.image_name]['pts_mask']] = (depth_corrected.squeeze() - 3) / 3
+                            depth_img = depth_img.reshape(1, H, W)
+                            torchvision.utils.save_image(depth_img, test_result_dir / f'{view.image_name}_depth_corrected.png')
+
+                    
+    progress_bar.close()
+    
+    return
+    # Train color model
+    pos_encoding.eval()
+    pos_network.eval()
+
+    residual_encoding = tcnn.Encoding(n_input_dims, config_tcnn['encoding'])
+    residual_network = tcnn.Network(3+residual_encoding.n_output_dims, n_output_dims, config_tcnn['network'])
+
+    residual_opt = torch.optim.AdamW([
+        {'params': residual_encoding.parameters()},
+        {'params': residual_network.parameters()}
+    ], lr=opt.residual_lr)
+    residual_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        residual_opt, T_max=opt.lap_level_upgrade_interval
+    )
+    residual_opt.zero_grad(set_to_none = True)
+    
+    level_result_dir = Path(scene.model_path) / f'residual_{cur_lap_level}'
+    level_result_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Training residual {cur_lap_level}")
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(1, opt.lap_level_upgrade_interval + 1), desc="Training residual")
+
+    train_view_pairs_stack = None
+
+    for iteration in range(1, opt.lap_level_upgrade_interval + 1):
+
+        total_iter += 1
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+            shuffle(viewpoint_stack)
+        view = viewpoint_stack.pop()
+        
+        final_image = render_image_with_residual(
+            view, 
+            pos_encoding, pos_network, 
+            residual_encoding, residual_network, 
+            render_pkg_last_train[view.image_name]
+        )
+        gt_image = view.gauss_pyramid[cur_lap_level].squeeze(0)
+
+        if dataset.use_decoupled_appearance:
+            Ll1_render = L1_loss_appearance(final_image, gt_image, gaussians, viewpoint_cam.uid)
+        else:
+            Ll1_render = l1_loss(final_image, gt_image)
+
+        ssim_loss = ssim(final_image, gt_image.unsqueeze(0))
+        loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim_loss)
+        loss.backward()
+
+        residual_opt.step()
+        residual_opt.zero_grad(set_to_none = True)
+        residual_scheduler.step()
+
+        with torch.no_grad():
+            psnr_val = psnr(final_image, gt_image).mean()
+
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}"})
+                progress_bar.update(10)
+
+            if tb_writer:
+                tb_writer.add_scalar('train_residual/l1_loss', Ll1_render.item(), total_iter)
+                tb_writer.add_scalar('train_residual/total_loss', loss.item(), total_iter)
+                tb_writer.add_scalar('train_residual/psnr', psnr_val.item(), total_iter)
+                tb_writer.add_scalar('train_residual/ssim', ssim_loss.item(), total_iter)
+                tb_writer.add_scalar('scene/lr_tcnn_residual', residual_opt.param_groups[0]['lr'], total_iter)
+
+            if iteration % 10 == 0 and opt.verbose:
+                base_color = render_pkg_last_train[view.image_name]['render']
+                residual_color = final_image - base_color
+                loss_map = torch.abs(final_image - gt_image).sum(dim=0)
+                torchvision.utils.save_image(loss_map, level_result_dir / f'{total_iter}_l1loss.png')
+                torchvision.utils.save_image(residual_color, level_result_dir / f'{total_iter}_residual_color.png')
+                torchvision.utils.save_image(final_image, level_result_dir / f'{total_iter}_final.png')
+                torchvision.utils.save_image(gt_image, level_result_dir / f'{total_iter}_gt.png')
+                torchvision.utils.save_image(base_color, level_result_dir / f'{total_iter}_base.png')
+
+            if iteration in testing_iterations or iteration == opt.lap_level_upgrade_interval:
+                print('\n[ITER {}] Residual Evaluating'.format(total_iter))
+                residual_encoding.eval()
+                residual_network.eval()
+
+                validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras(), 'render_pkg': render_pkg_last_test}, 
+                                    {'name': 'train', 'cameras' : scene.getTrainCameras(), 'render_pkg': render_pkg_last_train})
+
+                for config in validation_configs:
+                    test_result_dir = Path(scene.model_path) / f'test_residual_{total_iter:05d}_{config["name"]}'
+                    test_result_dir.mkdir(parents=True, exist_ok=True)
+                    if not config['cameras'] or len(config['cameras']) == 0:
+                        continue
+
+                    l1_test = 0.0
+                    psnr_test = 0.0
+                    for idx, test_view in enumerate(config['cameras']):
+                        # print(config['name'], test_view.image_name)
+                        test_gt_image = torch.clamp(test_view.gauss_pyramid[cur_lap_level], 0.0, 1.0)[0]
+                        render_result = render_image_with_residual(
+                            test_view, 
+                            pos_encoding, pos_network, 
+                            residual_encoding, residual_network, 
+                            config['render_pkg'][test_view.image_name]
+                        )
+                        l1_test += l1_loss(render_result, test_gt_image).mean().double()
+                        psnr_test += psnr(render_result, test_gt_image).mean().double()
+
+                        if opt.verbose:
+                            pts_xyz_world = get_pts_xyz_corrected_depth_offset(
+                                test_view,
+                                config['render_pkg'][test_view.image_name],
+                                pos_encoding, pos_network,
+                                False
+                            )
+                            base_color = config['render_pkg'][test_view.image_name]['render']
+                            residual_color = render_result - base_color
+                            torchvision.utils.save_image(residual_color, test_result_dir / f'{test_view.image_name}_residual.png')
+                            torchvision.utils.save_image(render_result, test_result_dir / f'{test_view.image_name}_render.png')
+                            torchvision.utils.save_image(test_gt_image, test_result_dir / f'{test_view.image_name}_gt.png')
+                            torchvision.utils.save_image(base_color, test_result_dir / f'{test_view.image_name}_base.png')
+                    psnr_test /= len(config['cameras'])
+                    l1_test /= len(config['cameras'])          
+                    print("\n[ITER {}] Residual Evaluating {}: L1 {} PSNR {}".format(total_iter, config['name'], l1_test, psnr_test))
+                    if config["name"] == "test":
+                        with open(scene.model_path + "/chkpnt" + str(total_iter) + ".txt", "w") as file_object:
+                            print("\n[ITER {}] Residual Evaluating {}: L1 {} PSNR {}".format(total_iter, config['name'], l1_test, psnr_test), file=file_object)
+                    if tb_writer:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, total_iter)
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, total_iter)
+            
+                torch.cuda.empty_cache()
+                residual_encoding.train()
+                residual_network.train()
+    
+    progress_bar.close()
 
 
 def prepare_output_and_logger(args, verbose):    
