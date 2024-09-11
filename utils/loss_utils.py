@@ -11,6 +11,7 @@
 
 import torch
 import torch.nn.functional as F
+import math
 from torch.autograd import Variable
 from math import exp
 
@@ -82,7 +83,7 @@ def _ncc(img1, img2, window, window_size, channel, size_average=True):
 
     return torch.mean(ncc, dim=2)
 
-    
+
 # def _ncc(pred, gt, window, channel):
 #     ntotpx, nviews, nc, h, w = pred.shape
 #     flat_pred = pred.view(-1, nc, h, w)
@@ -107,3 +108,41 @@ def _ncc(img1, img2, window, window_size, channel, size_average=True):
 
 #     return torch.mean(ncc, dim=2)
 
+
+
+def lncc(ref, nea):
+    # ref_gray: [batch_size, total_patch_size]
+    # nea_grays: [batch_size, total_patch_size]
+    bs, tps = nea.shape
+    patch_size = int(math.sqrt(tps))
+
+    ref_nea = ref * nea
+    ref_nea = ref_nea.view(bs, 1, patch_size, patch_size)
+    ref = ref.view(bs, 1, patch_size, patch_size)
+    nea = nea.view(bs, 1, patch_size, patch_size)
+    ref2 = ref.pow(2)
+    nea2 = nea.pow(2)
+
+    # sum over kernel
+    filters = torch.ones(1, 1, patch_size, patch_size, device=ref.device)
+    padding = patch_size // 2
+    ref_sum = F.conv2d(ref, filters, stride=1, padding=padding)[:, :, padding, padding]
+    nea_sum = F.conv2d(nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+    ref2_sum = F.conv2d(ref2, filters, stride=1, padding=padding)[:, :, padding, padding]
+    nea2_sum = F.conv2d(nea2, filters, stride=1, padding=padding)[:, :, padding, padding]
+    ref_nea_sum = F.conv2d(ref_nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+
+    # average over kernel
+    ref_avg = ref_sum / tps
+    nea_avg = nea_sum / tps
+
+    cross = ref_nea_sum - nea_avg * ref_sum
+    ref_var = ref2_sum - ref_avg * ref_sum
+    nea_var = nea2_sum - nea_avg * nea_sum
+
+    cc = cross * cross / (ref_var * nea_var + 1e-8)
+    ncc = 1 - cc
+    ncc = torch.clamp(ncc, 0.0, 2.0)
+    ncc = torch.mean(ncc, dim=1, keepdim=True)
+    mask = (ncc < 0.9)
+    return ncc, mask

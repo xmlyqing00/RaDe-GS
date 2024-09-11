@@ -17,6 +17,17 @@ import random
 import struct
 import os
 
+class Config:
+    def __init__(self, config_dict):
+        # Iterate over the dictionary and set attributes for each key-value pair
+        for key, value in config_dict.items():
+            setattr(self, key, value)
+
+    def __repr__(self):
+        # Representation method for displaying the configuration
+        return f'{self.__class__.__name__}({self.__dict__})'
+    
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
