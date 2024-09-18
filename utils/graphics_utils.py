@@ -95,7 +95,7 @@ def focal2fov(focal, pixels):
 
 # the following functions depths_double_to_points and depth_double_to_normal are adopted from https://github.com/hugoycj/2dgs-gaustudio/blob/main/utils/graphics_utils.py
 def depths_double_to_points(view, depthmap1, depthmap2):
-    W, H = depthmap1.shape[1:]
+    W, H = view.image_width, view.image_height
     fx = W / (2 * math.tan(view.FoVx / 2.))
     fy = H / (2 * math.tan(view.FoVy / 2.))
     intrins = torch.tensor(
@@ -114,7 +114,7 @@ def depths_double_to_points(view, depthmap1, depthmap2):
 
 
 def depth_to_points(view, depth):
-    W, H = depth.shape[1:]
+    H, W = depth.shape[1:]
     fx = W / (2 * math.tan(view.FoVx / 2.))
     fy = H / (2 * math.tan(view.FoVy / 2.))
     intrins = torch.tensor(
@@ -137,7 +137,7 @@ def depth_to_points(view, depth):
 
 
 def depth_to_points_fast(view, depth):
-    W, H = depth.shape[1:]
+    H, W = depth.shape[1:]
     intrins_inv = view.basic_intrins_inv.clone()
     intrins_inv[0, 0] /= W
     intrins_inv[1, 1] /= H
@@ -146,12 +146,12 @@ def depth_to_points_fast(view, depth):
     rays_d = points @ intrins_inv
     points = depth.reshape(-1, 1) * rays_d
 
-    points_gap = torch.tensor([[1.0, 1.0, 0.0]], device=points.device)
-    rays_d_gap = points_gap @ intrins_inv
-    radius = depth.reshape(-1, 1) * rays_d_gap[:, 0:1]
-    radius = abs(radius) * 0.707  # sqrt(2) / 2
+    # points_gap = torch.tensor([[1.0, 1.0, 0.0]], device=points.device)
+    # rays_d_gap = points_gap @ intrins_inv
+    # radius = depth.reshape(-1, 1) * rays_d_gap[:, 0:1]
+    # radius = abs(radius) * 0.707  # sqrt(2) / 2
 
-    return points, rays_d, radius
+    return points, rays_d
 
 
 def depth_double_to_normal(view, depth1, depth2):
@@ -284,3 +284,19 @@ def rot_mat_to_rot_vec(R):
     rotation_vector = theta * rotation_axis
     
     return rotation_vector
+
+
+def patch_offsets(h_patch_size, device):
+    offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
+    return torch.stack(torch.meshgrid(offsets, offsets)[::-1], dim=-1).view(1, -1, 2)
+
+def patch_warp(H, uv):
+    B, P = uv.shape[:2]
+    # H = H.view(B, 3, 3)
+    ones = torch.ones((B,P,1), device=uv.device)
+    homo_uv = torch.cat((uv, ones), dim=-1)
+
+    grid_tmp = torch.einsum("bik,bpk->bpi", H, homo_uv)
+    grid_tmp = grid_tmp.reshape(B, P, 3)
+    grid = grid_tmp[..., :2] / (grid_tmp[..., 2:] + 1e-10)
+    return grid

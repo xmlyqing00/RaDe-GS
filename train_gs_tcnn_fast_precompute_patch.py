@@ -12,13 +12,14 @@
 import os
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 # os.environ['TORCH_USE_CUDA_DSA'] = "1"
-import cv2
+
 import torch
+from torch.nn.functional import grid_sample, pad    
 import trimesh
 import datetime
 import tinycudann as tcnn
 from random import randint, shuffle, choice
-from utils.loss_utils import l1_loss, ssim, lncc, loss_in_neighbor_view
+from utils.loss_utils import l1_loss, ssim, lncc
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel, lap_pyramid
@@ -31,10 +32,10 @@ import pickle
 from pathlib import Path
 from tqdm import tqdm
 from matplotlib import colormaps
-from utils.vis_utils import apply_depth_colormap, apply_colormap, vis_patch
+from utils.vis_utils import apply_depth_colormap, apply_colormap
 from utils.image_utils import psnr
 from utils.network_utils import sphere_init_tcnn_network
-from utils.graphics_utils import depth_double_to_normal, depth_to_points, depth_to_points_fast, patch_offsets, patch_warp
+from utils.graphics_utils import depth_double_to_normal, depth_to_points, depth_to_points_fast
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -45,11 +46,8 @@ except ImportError:
 
 # TENSORBOARD_FOUND = False 
 
-patch_size = 3
-total_patch_size = (patch_size * 2 + 1) ** 2
-depth_inf = 10
-
 from scene.cameras import Camera
+
 
 # function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
 def L1_loss_appearance(image, gt_image, gaussians, view_idx, return_transformed_image=False):
@@ -79,135 +77,140 @@ def get_residual_image(
         view, 
         gaussians: GaussianModel,
         base_material: tuple, 
+        render_pkg_last: dict, 
         gt_image: torch.Tensor, 
         train_result_dir: Path,
-        verbose: bool,
-        far_plane, near_plane
-    ) -> tuple:
+        verbose: bool
+    ):
+
+    if render_pkg_last.get(view.image_name) is not None:
+        return
 
     with torch.no_grad():
 
         pipe, background, scene_min, scene_range = base_material
 
         render_pkg = render(view, gaussians, pipe, background, image_height=gt_image.shape[1], image_width=gt_image.shape[2])
-        render_pkg_to_save = dict()
+        render_pkg['depth'] = render_pkg['depth'] / render_pkg['mask']
+        render_pkg['depth'] = torch.nan_to_num(render_pkg['depth'], 0, 0)
+        render_pkg['render_loss'] = torch.abs(gt_image - render_pkg['render'])
+        render_pkg['l1_loss'] = render_pkg['render_loss'].mean().double()
+        render_pkg['psnr'] = psnr(render_pkg['render'], gt_image).mean().double()
 
-        render_pkg['depth'] = torch.nan_to_num(render_pkg['depth'] / render_pkg['mask'], depth_inf, depth_inf)
-        # render_pkg['render_loss'] = torch.abs(gt_image - render_pkg['render'])
-        # render_pkg['l1_loss'] = render_pkg['render_loss'].mean().double()
-        # render_pkg['psnr'] = psnr(render_pkg['render'], gt_image).mean().double()
-
-        # render_pkg['depth'][render_pkg['depth'] == 0] = depth_inf
-        pts_xyz, rays_d = depth_to_points_fast(view, render_pkg['depth'])
+        pts_xyz, rays_d, pts_radius = depth_to_points_fast(view, render_pkg['depth'])
         
-        # pts_mask = (render_pkg['depth'] > 0).view(-1)
-        # pts_xyz = pts_xyz[pts_mask]
-
-        pts_xyz = pts_xyz.view(-1, 3)
-        pts_color = gt_image.permute(1, 2, 0).reshape(-1, 3)
-        # d = render_pkg['depth'].view(-1)
-        # pts_color[:, 0] = (d - d.min()) / (d.max() - d.min())
-
+        pts_mask = (render_pkg['depth'] > 0).view(-1)
+        pts_xyz = pts_xyz[pts_mask]
         pts_xyz_view = torch.concat([pts_xyz, torch.ones_like(pts_xyz[:, 0:1])], dim=-1)
         pts_xyz_world = pts_xyz_view @ view.world_view_transform_inv
         pts_xyz_world = pts_xyz_world[:, :3]
 
-        render_pkg_to_save['pts_xyz_world'] = pts_xyz_world
-        render_pkg_to_save['rays_d'] = rays_d
-        render_pkg_to_save['depth'] = render_pkg['depth']
-        render_pkg_to_save['render'] = render_pkg['render']
-        render_pkg_to_save['residual_image'] = gt_image - render_pkg['render']
-
-
-        # render_pts = dict()
-        # render_pts['pts_depth'] = render_pkg['depth'].reshape(-1, 1)[pts_mask]
-        # render_pts['rays_d'] = rays_d[pts_mask]
-        # render_pts['pts_mask'] = pts_mask
-        # render_pts['pts_xyz_world'] = pts_xyz_world 
-        # render_pkg['pts_xyz_world_normalized'] = (pts_xyz_world - scene_min) / scene_range
-        # render_pts['pts_residual_color'] = render_pkg['residual_image'].permute(1, 2, 0).reshape(-1, 3)[pts_mask]
-        # render_pts['pts_color'] = gt_image.permute(1, 2, 0).reshape(-1, 3)[pts_mask]
-        # render_pts['pts_normal'] = render_pkg['normal'].reshape(-1, 3)[pts_mask]
+        render_pkg['pts_depth'] = render_pkg['depth'].reshape(-1, 1)[pts_mask]
+        render_pkg['rays_d'] = rays_d[pts_mask]
+        render_pkg['pts_mask'] = pts_mask
+        render_pkg['pts_xyz_world'] = pts_xyz_world 
+        render_pkg['pts_xyz_world_normalized'] = (pts_xyz_world - scene_min) / scene_range
+        render_pkg['residual_image'] = gt_image - render_pkg['render']
+        pts_residual_color = render_pkg['residual_image'].permute(1, 2, 0).reshape(-1, 3)
+        if pts_mask is not None:
+            pts_residual_color = pts_residual_color[pts_mask]
+        render_pkg['pts_residual_color'] = pts_residual_color
+        pts_color = gt_image.permute(1, 2, 0).reshape(-1, 3)
+        if pts_mask is not None:
+            pts_color = pts_color[pts_mask]
+        render_pkg['pts_color'] = pts_color
         
+        render_pkg_last[view.image_name] = render_pkg
+
         if verbose:
             train_result_dir.mkdir(parents=True, exist_ok=True)
-            
-            torchvision.utils.save_image(torch.abs(render_pkg_to_save['residual_image']), train_result_dir / f'{view.image_name}_l1loss.png')
-            torchvision.utils.save_image(render_pkg['render'], train_result_dir / f'{view.image_name}_render.png')
-            torchvision.utils.save_image(gt_image, train_result_dir / f'{view.image_name}_gt.png')
-            torchvision.utils.save_image(render_pkg_to_save['residual_image'], train_result_dir / f'{view.image_name}_residual.png')
-
-            depth_img = apply_depth_colormap(render_pkg_to_save['depth'].permute(1, 2, 0), near_plane=near_plane, far_plane=far_plane).cpu().numpy() * 255
-            imageio.imwrite(train_result_dir / f'{view.image_name}_depth.png', depth_img.astype(np.uint8))
-
             vis_pcd = trimesh.PointCloud(
                 pts_xyz_world.cpu().detach().numpy(), 
                 pts_color.cpu().detach().numpy()
-                # depth_img.reshape(-1, 3) / 255
             )
             vis_pcd.export(train_result_dir / f'{view.image_name}_pcd_world_scale_sqrt2.ply')
 
-    return render_pkg_to_save
+            torchvision.utils.save_image(render_pkg['render_loss'], train_result_dir / f'{view.image_name}_l1loss.png')
+            torchvision.utils.save_image(render_pkg['render'], train_result_dir / f'{view.image_name}_render.png')
+            torchvision.utils.save_image(gt_image, train_result_dir / f'{view.image_name}_gt.png')
+            torchvision.utils.save_image(render_pkg['residual_image'], train_result_dir / f'{view.image_name}_residual.png')
 
 
 def pos_dir_encoding(view, render_pkg, pos_encoding, dir_encoding):
-    pts_encoding = pos_encoding(render_pkg['pts_xyz_world'] + 5)
+    pts_xyz_normalized = render_pkg['pts_xyz_world_normalized']
+    pts_encoding = pos_encoding(pts_xyz_normalized)
 
     rays_d_homo = torch.concat([render_pkg['rays_d'] , torch.ones_like(render_pkg['rays_d'][:, 0:1])], dim=-1)
     rays_d_world = rays_d_homo @ view.world_view_transform_inv
     rays_d_world = (rays_d_world[:, :3] + 1.) / 2.
     pts_dir_embed = dir_encoding(rays_d_world)
-    pts_input = torch.concat([render_pkg['pts_xyz_world'], pts_encoding, rays_d_world, pts_dir_embed], dim=-1)
+    pts_input = torch.concat([pts_xyz_normalized, pts_encoding, rays_d_world, pts_dir_embed], dim=-1)
 
     return pts_input
 
 
-def geometry_net(view, render_pkg, pts_input: torch.Tensor, pos_network):
+def geometry_net(view, render_pkg, pts_input: torch.Tensor, pos_network, return_depth_map: bool = True):
 
     # compute depth offset
-    feat = pos_network(pts_input).float()
+    feat = pos_network(pts_input).float() * 2 - 1
     d_offset = feat
 
     # depth to view
-    pts_depth = render_pkg['depth'].view(-1, 1)
-    depth_corrected = pts_depth + d_offset
+    depth_corrected = render_pkg['pts_depth'] + d_offset
     depth_corrected = torch.clamp(depth_corrected, 0, None)
-    depth_corrected = depth_corrected.reshape(*render_pkg['depth'].shape)
-    # pts_xyz_corrected = render_pts['rays_d'] * depth_corrected
+    pts_xyz_corrected = render_pkg['rays_d'] * depth_corrected
 
     # view to world
-    # corrected_homo = torch.concat([pts_xyz_corrected, torch.ones_like(pts_xyz_corrected[:, 0:1])], dim=-1)
-    # pts_xyz_world = corrected_homo @ view.world_view_transform_inv
+    corrected_homo = torch.concat([pts_xyz_corrected, torch.ones_like(pts_xyz_corrected[:, 0:1])], dim=-1)
+    pts_xyz_world = corrected_homo @ view.world_view_transform_inv
 
     # update the depth map
-    # depth_map = depth_map.reshape(*base_depth_map.shape)
+    if return_depth_map:
+        depth_map = render_pkg['depth'].clone().reshape(-1, 1)
+        depth_map[render_pkg['pts_mask']] = depth_corrected
+        depth_map = depth_map.reshape(*render_pkg['depth'].shape)
 
-    pts_xyz, _ = depth_to_points_fast(view, depth_corrected)
-    # pts_mask = (depth_map > 0).view(-1)
-    pts_xyz_view = torch.concat([pts_xyz, torch.ones_like(pts_xyz[:, 0:1])], dim=-1)
-    pts_xyz_world = pts_xyz_view @ view.world_view_transform_inv
-    # pts_xyz_world = pts_xyz_world[:, :3]
+        return pts_xyz_world, feat, depth_map
+    else:
+        return pts_xyz_world, feat, None
 
-    # points = pts_xyz_world[:, :3].reshape(*depth_corrected.shape, 3)
-    points = pts_xyz.reshape(*depth_corrected.shape, 3)
-    grad = torch.zeros_like(points)
-    dx = points[:,2:, 1:-1] - points[:,:-2, 1:-1]
-    dy = points[:,1:-1, 2:] - points[:,1:-1, :-2]
-    normal_map = torch.cross(dx, dy, dim=-1)
-    normal_map = torch.nn.functional.normalize(normal_map, dim=-1)
-    grad[:,1:-1, 1:-1, :] = normal_map
 
-    homo_plane_depth = (grad.view(-1, 3) * pts_xyz).sum(-1).abs()
+def loss_in_neighbor_view(
+        pts_homo: torch.Tensor, view_neighbor: Camera, 
+        depth_map_neighbor: torch.Tensor, 
+        color_map_neighbor: torch.Tensor,
+        pts_colors: torch.Tensor,
+        depth_valid_threshold: float,
+    ):
+    pts_homo_proj = pts_homo @ view_neighbor.world_view_transform
+    proj_uvw = pts_homo_proj[:, :3] @ view_neighbor.intrins
+    proj_depth = proj_uvw[:, 2:3]
+    proj_uv = proj_uvw / proj_depth
+    proj_uv[:, 0] = proj_uv[:, 0] / (view_neighbor.image_width-1) * 2 - 1
+    proj_uv[:, 1] = proj_uv[:, 1] / (view_neighbor.image_height-1) * 2 - 1
+    proj_uv = proj_uv[:, :2].reshape(1, -1, 1, 2)
 
-    pts_data = {
-        'pts_homo': pts_xyz_world,  # (N, 4)
-        'depth': depth_corrected.unsqueeze(0),  # (1, 1, H, W)
-        'homo_plane_depth': homo_plane_depth,
-        'normal': grad, # (1, H, W, 3)
-        'encoding': pts_input
-    }
+    sampled_depth = grid_sample(
+        depth_map_neighbor.unsqueeze(1), 
+        proj_uv, mode='bilinear', align_corners=True
+    ).squeeze()
 
-    return pts_data
+    if color_map_neighbor is not None:
+        sampled_color = grid_sample(
+            color_map_neighbor, 
+            proj_uv, mode='bilinear', align_corners=True
+        ).squeeze().permute(1, 0)
+
+    diff_depth = sampled_depth - proj_depth.squeeze(1)
+    valid_mask = torch.abs(diff_depth) < depth_valid_threshold
+    loss = diff_depth[valid_mask].abs().mean()
+
+    if color_map_neighbor is not None:
+        # loss_color = (sampled_color - pts_colors)[valid_mask].abs().mean()
+        ncc, ncc_mask = lncc(sampled_color[valid_mask], pts_colors[valid_mask])
+        loss_color = ncc[ncc_mask.squeeze()].mean()
+
+    return loss, loss_color
 
 
 def render_image_with_residual(
@@ -224,20 +227,11 @@ def render_image_with_residual(
     # pts_input = torch.concat([feat, pts_dir_embed], dim=-1)
     residual_color_pts = residual_network(pts_encoding_cur).float() * 2 - 1
 
-    final_image = render_pkg['render'].view(3, -1) + residual_color_pts.permute(1, 0)
-    # final_image[:, render_pkg['pts_mask']] += 
+    final_image = render_pkg['render'].clone().view(3, -1)
+    final_image[:, render_pkg['pts_mask']] += residual_color_pts.permute(1, 0)
     final_image = final_image.view(3, *render_pkg['render'].shape[1:])
 
     return final_image
-
-
-def compute_pts_data(
-    view, render_pkg, pos_encoding, dir_encoding, pos_network
-):
-    pts_encoding = pos_dir_encoding(view, render_pkg, pos_encoding, dir_encoding)
-    pts_data = geometry_net(view, render_pkg, pts_encoding, pos_network)
-
-    return pts_data
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
@@ -273,15 +267,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cur_lap_level = dataset.lap_pyramid_level - 1
 
     ## Base model: 3DGS
-    skip_base_training = False
     if checkpoint is not None:
         checkpoint = Path(checkpoint)
         if checkpoint.exists():
             print(f"Loading checkpoint {checkpoint}")
             saved_dict = pickle.load(open(checkpoint / 'base_material.pkl', "rb"))
             base_material = saved_dict['base_materical']
-            render_pkg_train = saved_dict['render_pkg_train']
-            render_pkg_test = saved_dict['render_pkg_test']
+            render_pkg_last_train = saved_dict['render_pkg_last_train']
+            render_pkg_last_test = saved_dict['render_pkg_last_test']
             train_view_pairs = saved_dict['train_view_pairs']
             (model_params, first_iter) = torch.load(checkpoint / 'chkpnt3000.pth')
             gaussians.restore(model_params, opt)
@@ -289,6 +282,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             skip_base_training = True
         else:
             print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
+            skip_base_training = False
+    else:
+        skip_base_training = False
     
     if not skip_base_training:
         if testing_iterations[-1] < opt.base_iterations:
@@ -351,7 +347,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 Ll1_render = l1_loss(final_image, gt_image)
 
-            if opt.verbose and iteration % 100 == 0:
+            if opt.verbose and (iteration % 50 == 0 or iteration < 100):
                 loss_map = torch.abs(final_image - gt_image).sum(dim=0)
                 rendered_image_color = apply_colormap(
                     torch.clip(torch.max(rendered_image, dim=0, keepdim=True)[0].permute(1, 2, 0), min=0, max=1)
@@ -360,7 +356,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # torchvision.utils.save_image(rendered_alpha_t, out_dir / f'{total_iter:05d}_alpha_t.png')
                 torchvision.utils.save_image(loss_map, out_dir / f'{total_iter:05d}_l1loss.png')
                 torchvision.utils.save_image(rendered_image, out_dir / f'{total_iter:05d}_rendered.png')
-                # torchvision.utils.save_image(rendered_image_color, out_dir / f'{total_iter:05d}_rendered_color.png')
+                torchvision.utils.save_image(rendered_image_color, out_dir / f'{total_iter:05d}_rendered_color.png')
                 torchvision.utils.save_image(final_image, out_dir / f'{total_iter:05d}_final.png')
                 torchvision.utils.save_image(gt_image, out_dir / f'{total_iter:05d}_gt.png')
 
@@ -388,24 +384,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_normal_loss = (1-depth_ratio) * normal_error_map[0].mean() + depth_ratio * normal_error_map[1].mean()
                 lambda_depth_normal = opt.lambda_depth_normal
 
-                if opt.verbose and iteration % 100 == 0:
+                if opt.verbose and iteration % 50 == 0:
 
-                    depth_img = apply_depth_colormap(rendered_depth.permute(1, 2, 0), near_plane=dataset.near_plane, far_plane=dataset.far_plane).cpu().numpy() * 255
+                    depth_img = apply_depth_colormap(rendered_depth.permute(1, 2, 0)).cpu().numpy() * 255
                     imageio.imwrite(out_dir / f'{total_iter:05d}_depth.png', depth_img.astype(np.uint8))
 
-                    rendered_normal_img = (render_pkg["normal"].permute(1, 2, 0).detach().cpu().numpy() + 1) / 2
-                    rendered_normal_img = np.clip(np.rint(rendered_normal_img * 255), 0, 255).astype(np.uint8)
-                    imageio.imwrite(out_dir / f'{iteration:05d}_normal.png', rendered_normal_img)
+                    rendered_normal_img = np.clip(np.rint(rendered_normal.detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                    imageio.imwrite(out_dir / f'{total_iter:05d}_normal.png', rendered_normal_img)
 
-                    # depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
-                    rendered_normal_img = (depth_middepth_normal[0].detach().cpu().numpy() + 1) / 2
-                    rendered_normal_img = np.clip(np.rint(rendered_normal_img * 255), 0, 255).astype(np.uint8)
-                    imageio.imwrite(out_dir / f'{total_iter:05d}_normal_from_depth0.png', rendered_normal_img)
+                    depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                    imageio.imwrite(out_dir / f'{total_iter:05d}_normal_from_depth0.png', depth_middepth_normal_map)
 
-                    # depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[1].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
-                    rendered_normal_img = (depth_middepth_normal[1].detach().cpu().numpy() + 1) / 2
-                    rendered_normal_img = np.clip(np.rint(rendered_normal_img * 255), 0, 255).astype(np.uint8)
-                    imageio.imwrite(out_dir / f'{total_iter:05d}_normal_from_depth1.png', rendered_normal_img)
+                    depth_middepth_normal_map = np.clip(np.rint(depth_middepth_normal[1].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
+                    imageio.imwrite(out_dir / f'{total_iter:05d}_normal_from_depth1.png', depth_middepth_normal_map)
 
                     normal_error_img = np.clip(np.rint(normal_error_map[0].detach().cpu().numpy() * 255), 0, 255).astype(np.uint8)
                     imageio.imwrite(out_dir / f'{total_iter:05d}_normal_err0.png', normal_error_img)
@@ -486,75 +477,79 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         base_material = (pipe, background, dataset.scene_min, dataset.scene_range)
             
         # Residual Training
-        cur_lap_level = 0
-        print('Getting residual image from train cameras')
-        # Get residual image
-        training_views = scene.getTrainCameras().copy()
-        render_pkg_train = dict()
-        if training_views and len(training_views) > 0:
-            for view in training_views:
-                render_pkg = get_residual_image(
-                    view, 
-                    gaussians, 
-                    base_material, 
-                    view.gauss_pyramid[cur_lap_level].squeeze(0), 
-                    Path(scene.model_path) / f'level_{cur_lap_level}_train',
-                    opt.verbose, dataset.far_plane, dataset.near_plane
-                )
-                render_pkg_train[view.uid] = render_pkg
+        for cur_lap_level in range(max(0, dataset.lap_pyramid_level - 2), -1, -1):
+            print('Getting residual image from train cameras')
+            # Get residual image
+            training_views = scene.getTrainCameras().copy()
+            if training_views and len(training_views) > 0:
+                render_pkg_last_train = {}
+                for view in training_views:
+                    get_residual_image(
+                        view, 
+                        gaussians, 
+                        base_material, 
+                        render_pkg_last_train, 
+                        view.gauss_pyramid[cur_lap_level].squeeze(0), 
+                        Path(scene.model_path) / f'level_{cur_lap_level}',
+                        opt.verbose
+                    )
+            else:
+                render_pkg_last_train = None
+            print('Getting residual image from test cameras')
+            testing_views = scene.getTestCameras().copy()
+            if testing_views and len(testing_views) > 0:
+                render_pkg_last_test = {}
+                for view in testing_views:
+                    get_residual_image(
+                        view, 
+                        gaussians, 
+                        base_material, 
+                        render_pkg_last_test, 
+                        view.gauss_pyramid[cur_lap_level].squeeze(0), 
+                        Path(scene.model_path) / f'level_{cur_lap_level}',
+                        opt.verbose
+                    )
+            else:
+                render_pkg_last_test = None
 
-        print('Getting residual image from test cameras')
-        testing_views = scene.getTestCameras().copy()
-        render_pkg_test = dict()
-        if testing_views and len(testing_views) > 0:
-            for view in testing_views:
-                render_pkg = get_residual_image(
-                    view, 
-                    gaussians, 
-                    base_material, 
-                    view.gauss_pyramid[cur_lap_level].squeeze(0), 
-                    Path(scene.model_path) / f'level_{cur_lap_level}_test',
-                    opt.verbose, dataset.far_plane, dataset.near_plane
-                )
-                render_pkg_test[view.uid] = render_pkg
+            # collect neighboring cameras for training
+            print('Collecting neighboring cameras for training')
+            viewpoint_stack = scene.getTrainCameras().copy()
+            view_num = len(viewpoint_stack)
+            view_dist = np.zeros((view_num, view_num))
 
-        # collect neighboring cameras for training
-        print('Collecting neighboring cameras for training')
-        viewpoint_stack = scene.getTrainCameras().copy()
-        view_num = len(viewpoint_stack)
-        view_dist = np.zeros((view_num, view_num))
-
-        with torch.no_grad():
-            for view_idx1 in range(view_num):
-                
-                view1 = viewpoint_stack[view_idx1]
-
-                for view_idx2 in range(view_idx1 + 1, view_num):
+            with torch.no_grad():
+                for view_idx1 in range(view_num):
                     
-                    view2 = viewpoint_stack[view_idx2]
-                    rot_dist = np.linalg.norm(view1.rot_vec - view2.rot_vec)
-                    trans_dist = np.linalg.norm(view1.T - view2.T)
-                    view_dist[view_idx1, view_idx2] = rot_dist + trans_dist
-                    view_dist[view_idx2, view_idx1] = view_dist[view_idx1, view_idx2]
+                    view1 = viewpoint_stack[view_idx1]
 
-        train_view_pairs = []
-        neighbor_num = 3
-        for view_idx1 in range(view_num):
+                    for view_idx2 in range(view_idx1 + 1, view_num):
+                        
+                        view2 = viewpoint_stack[view_idx2]
+                        rot_dist = np.linalg.norm(view1.rot_vec - view2.rot_vec)
+                        trans_dist = np.linalg.norm(view1.T - view2.T)
+                        view_dist[view_idx1, view_idx2] = rot_dist + trans_dist
+                        view_dist[view_idx2, view_idx1] = view_dist[view_idx1, view_idx2]
 
-            neighbor_idx = np.argsort(view_dist[view_idx1])
-            train_view_pairs.append((view_idx1, *neighbor_idx[1:1 + neighbor_num]))
-        
-        # print(train_view_pairs)
-        # Record result, prepare next level 
-        pickle.dump(
-            {
-                'base_materical': base_material, 
-                'render_pkg_train': render_pkg_train,
-                'render_pkg_test': render_pkg_test,
-                'train_view_pairs': train_view_pairs
-            }, 
-            open(scene.model_path + "/base_material.pkl", "wb")
-        )
+            train_view_pairs = []
+            neighbor_num = 3
+            for view_idx1 in range(view_num):
+
+                neighbor_idx = np.argsort(view_dist[view_idx1])
+                train_view_pairs.append((view_idx1, *neighbor_idx[1:1 + neighbor_num]))
+            
+            # print(train_view_pairs)
+            # Record result, prepare next level 
+            pickle.dump(
+                {
+                    'base_materical': base_material, 
+                    'render_pkg_last_train': render_pkg_last_train, 
+                    'render_pkg_last_test': render_pkg_last_test,
+                    'train_view_pairs': train_view_pairs
+                }, 
+                open(scene.model_path + "/base_material.pkl", "wb")
+            )
+
     
     config_pos_tcnn = {
         'encoding': {
@@ -579,9 +574,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         'network': {
             'otype': 'FullyFusedMLP',
             'activation': 'LeakyReLU',
-            'output_activation': 'None',
-            'n_neurons': 64,
-            'n_hidden_layers': 4,
+            'output_activation': 'Sigmoid',
+            'n_neurons': dataset.tcnn_num_neurons,
+            'n_hidden_layers': dataset.tcnn_num_layers,
         }
     }
 
@@ -597,7 +592,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     n_input_dims = 3
     n_output_dims = 3
-    # pos_feat_dim = 16
+    pos_feat_dim = 16
 
     pos_encoding = tcnn.Encoding(n_input_dims, config_pos_tcnn['encoding'])
     dir_encoding = tcnn.Encoding(n_input_dims, config_dir_tcnn['encoding'])
@@ -620,9 +615,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     )
     residual_opt.zero_grad(set_to_none = True)
     
-    offsets_template = patch_offsets(3, 'cuda')
-    patch_template = None
-    
     if opt.verbose:
         train_result_dir = Path(scene.model_path) / f'train_verbose'
         train_result_dir.mkdir(parents=True, exist_ok=True)
@@ -642,14 +634,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not train_view_pairs_stack:
             train_view_pairs_stack = train_view_pairs.copy()
             shuffle(train_view_pairs_stack)
-        view_pair = train_view_pairs_stack.pop()
-        # view_pair = train_view_pairs_stack[5]
+        # view_pair = train_view_pairs_stack.pop()
+        view_pair = train_view_pairs_stack[5]
 
         view_cur = training_views[view_pair[0]]
-        # view_cur = training_views[16]
-        # view_neighbor = training_views[15]
         view_neighbor = training_views[choice(view_pair[1:])]
-        # view_neighbor = training_views[view_pair[0]]
         # view_neighbor = training_views[view_pair[1]]
 
         # view_neighbor = training_views[view_pair[0]]
@@ -657,30 +646,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # view_neighbor = training_views[view_pair[1]]
 
-
-        W, H = view_cur.image_width, view_cur.image_height
-        if patch_template is None:
-            grid_x, grid_y = torch.meshgrid(torch.arange(W)+0.5, torch.arange(H)+0.5, indexing='xy')
-            pixels = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2).float().cuda()
-            patch_template = pixels.reshape(-1, 1, 2) + offsets_template.float()
-        
-        pts_data_cur = compute_pts_data(view_cur, render_pkg_train[view_cur.uid], pos_encoding, dir_encoding, pos_network)
-        pts_data_neighbor = compute_pts_data(view_cur, render_pkg_train[view_cur.uid], pos_encoding, dir_encoding, pos_network)
-
-        loss_geo_dict, debug_dict = loss_in_neighbor_view(
-            view_cur, view_neighbor, 
-            pts_data_cur, pts_data_neighbor,
-            patch_template,
-            opt.depth_valid_threshold
+        # W, H = view_cur.image_width, view_cur.image_height
+        pts_encoding_cur = pos_dir_encoding(view_cur, render_pkg_last_train[view_cur.image_name], pos_encoding, dir_encoding)
+        pts_encoding_neighbor = pos_dir_encoding(view_neighbor, render_pkg_last_train[view_neighbor.image_name], pos_encoding, dir_encoding)
+        pts_xyz_corrected_cur, feat_cur, depth_map_cur = geometry_net(
+            view_cur, render_pkg_last_train[view_cur.image_name], pts_encoding_cur, pos_network
         )
-        # loss_geo = loss_geo_dict['total']
+        pts_xyz_corrected_neighbor, feat_neighbor, depth_map_neighbor = geometry_net(
+            view_neighbor, render_pkg_last_train[view_neighbor.image_name], pts_encoding_neighbor, pos_network
+        )
+        
+        pts_xyz_color_cur = view_cur.gray_patch_feat.reshape(25, -1).permute(1, 0)[render_pkg_last_train[view_cur.image_name]['pts_mask']]
+        pts_xyz_color_neighbor = view_neighbor.gray_patch_feat.reshape(25, -1).permute(1, 0)[render_pkg_last_train[view_neighbor.image_name]['pts_mask']]
+        gt_color_cur = view_cur.gray_patch_feat
+        gt_color_neighbor = view_neighbor.gray_patch_feat
+        # gt_color_neighbor = view_neighbor.original_image.unsqueeze(0)
+        
+        # pts_xyz_color_cur = render_pkg_last_train[view_cur.image_name]['pts_color']
+        # pts_xyz_color_neighbor = render_pkg_last_train[view_neighbor.image_name]['pts_color']
+        # pts_xyz_residual_color = render_pkg_last_train[view.image_name]['pts_residual_color']
+
+        loss_depth, loss_corr_color = loss_in_neighbor_view(
+            pts_xyz_corrected_cur, view_neighbor, 
+            depth_map_neighbor, 
+            gt_color_neighbor, pts_xyz_color_cur,
+            opt.depth_valid_threshold,
+        )
+
+        loss_depth2, loss_corr_color2 = loss_in_neighbor_view(
+            pts_xyz_corrected_neighbor, view_cur, 
+            depth_map_cur, 
+            gt_color_cur, pts_xyz_color_neighbor,
+            opt.depth_valid_threshold,
+        )
+        loss_geo = loss_depth + loss_depth2 + 0.1 * (loss_corr_color + loss_corr_color2)
+        # loss_geo = loss_depth + loss_depth2
+
+        final_image = render_image_with_residual(
+            view_cur, pts_encoding_cur,
+            residual_network, 
+            render_pkg_last_train[view_cur.image_name]
+        )
         gt_image = view_cur.gauss_pyramid[cur_lap_level].squeeze(0)
-        final_image = gt_image.clone()
-        # final_image = render_image_with_residual(
-        #     view_cur, pts_data_cur['encoding'],
-        #     residual_network, 
-        #     render_pkg_train[view_cur.uid]
-        # )
 
         # if dataset.use_decoupled_appearance:
             # Ll1_render = L1_loss_appearance(final_image, gt_image, gaussians, viewpoint_cam.uid)
@@ -690,14 +697,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_loss = ssim(final_image, gt_image.unsqueeze(0))
         loss_rgb = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim_loss)
         # loss = loss_geo + 100 * loss_rgb
-        loss = 10 * loss_geo_dict['geo'] + loss_geo_dict['color']
+        loss = loss_geo
+
+        # if iteration > 1000 and loss_depth.item() > 0.05:
+            # print(iteration, view_cur.image_name, view_neighbor.image_name)
+        # if loss_corr_color2.item() > 0.05:
+            # print(iteration, view_pair, view_cur.image_name, view_neighbor.image_name)
 
         loss.backward()
 
         residual_opt.step()
         residual_opt.zero_grad(set_to_none = True)
         residual_scheduler.step()
-        # continue
+
         with torch.no_grad():
             if iteration == 1 or iteration % 10 == 0:
                 psnr_val = psnr(final_image, gt_image).mean()
@@ -710,73 +722,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
 
                 if opt.verbose:
-                    
-                    patch_ids = np.random.choice(debug_dict['cur_patch'].shape[0], 5)
-                    img_patch_dict = vis_patch(debug_dict, view_cur.original_image, view_neighbor.original_image, patch_ids)
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_patch.png', img_patch_dict['img_patch_cur'])
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_neighbor_patch.png', img_patch_dict['img_patch_neighbor'])
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_patch_w_img.png', img_patch_dict['gt_img_cur'])   
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_neighbor_patch_w_img.png', img_patch_dict['gt_img_neighbor'])
-
                     torchvision.utils.save_image(view_cur.original_image, train_result_dir / f'{iteration}_cur_{view_cur.image_name}_gt.png')
                     torchvision.utils.save_image(view_neighbor.original_image, train_result_dir / f'{iteration}_neighbor_{view_neighbor.image_name}_gt.png')
 
-                    depth_img = apply_depth_colormap(pts_data_cur['depth'][0].permute(1, 2, 0), near_plane=dataset.near_plane, far_plane=dataset.far_plane).cpu().numpy() * 255
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_depth.png', depth_img.astype(np.uint8))
+                    depth_map_color = torch.clamp((depth_map_cur - 3) / 3, 0, 1).squeeze()
+                    depth_color_img = viridis_colormap[(depth_map_color * 255).long()]
+                    depth_color_img = depth_color_img.reshape(depth_map_color.shape[0], depth_map_color.shape[1], 3).permute(2, 0, 1)
+                    torchvision.utils.save_image(depth_color_img, train_result_dir / f'{iteration}_cur_{view_cur.image_name}_depth.png')
 
-                    depth2 = (((pts_data_cur['depth'].squeeze().detach().cpu().numpy()-1)/3).clip(0, 1) * 255).astype(np.uint8)
-                    depth2_img = cv2.applyColorMap(depth2, cv2.COLORMAP_JET)
-                    cv2.imwrite(train_result_dir / f'{total_iter:05d}_cur_depth2.png', depth2_img)  
+                    depth_map_color = torch.clamp((render_pkg_last_train[view_cur.image_name]['depth'] - 3) / 3, 0, 1).squeeze()
+                    depth_color_img = viridis_colormap[(depth_map_color * 255).long()]
+                    depth_color_img = depth_color_img.reshape(depth_map_color.shape[0], depth_map_color.shape[1], 3).permute(2, 0, 1)
+                    torchvision.utils.save_image(depth_color_img, train_result_dir / f'{iteration}_cur_{view_cur.image_name}_depth_base.png')
 
-                    depth_img = apply_depth_colormap(render_pkg_train[view_cur.uid]['depth'].permute(1, 2, 0), near_plane=dataset.near_plane, far_plane=dataset.far_plane).cpu().numpy() * 255
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_depth_base.png', depth_img.astype(np.uint8))
+                    # depth_map_color = torch.clamp((depth_map_neighbor - 3) / 3, 0, 1).squeeze()
+                    # depth_color_img = viridis_colormap[(depth_map_color * 255).long()]
+                    # depth_color_img = depth_color_img.reshape(depth_map_color.shape[0], depth_map_color.shape[1], 3).permute(2, 0, 1)
+                    # torchvision.utils.save_image(depth_color_img, train_result_dir / f'{iteration}_neighbor_{view_neighbor.image_name}_depth.png')
 
-                    rendered_normal_img = (pts_data_cur["normal"].squeeze(0).detach().cpu().numpy() + 1) / 2
-                    rendered_normal_img = np.clip(np.rint(rendered_normal_img * 255), 0, 255).astype(np.uint8)
-                    imageio.imwrite(train_result_dir / f'{iteration:05d}_normal.png', rendered_normal_img)
-
-                    depth_diff = pts_data_cur['depth'] - render_pkg_train[view_cur.uid]['depth']
+                    depth_diff = depth_map_cur - render_pkg_last_train[view_cur.image_name]['depth']
                     depth_diff = torch.clamp(depth_diff.squeeze(), -0.5, 0.5) + 0.5
                     colormap = colormaps.get_cmap('bwr')
                     depth_color_img = colormap(depth_diff.cpu().numpy())
                     depth_color_img = (depth_color_img[..., :3] * 255).astype(np.uint8)
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_{view_cur.uid}_depth_diff.png', depth_color_img)
+                    imageio.imwrite(train_result_dir / f'{iteration}_cur_{view_cur.image_name}_depth_diff.png', depth_color_img)
 
-                    depth_diff = torch.clamp(debug_dict['depth_err'].squeeze(), -2, 2) / 4 + 0.5
-                    colormap = colormaps.get_cmap('bwr')
-                    depth_color_img = colormap(depth_diff.cpu().numpy())
-                    depth_color_img = (depth_color_img[..., :3] * 255).astype(np.uint8)
-                    imageio.imwrite(train_result_dir / f'{total_iter:05d}_cur_{view_cur.uid}_depth_err.png', depth_color_img)
-
-                    # base_color = render_pkg_train[view_cur.uid]['render']
-                    # residual_color = final_image - base_color
-                    # loss_map = torch.abs(final_image - gt_image).sum(dim=0)
-                    # torchvision.utils.save_image(loss_map, train_result_dir / f'{total_iter}_l1loss.png')
-                    # torchvision.utils.save_image(residual_color, train_result_dir / f'{total_iter}_residual_color.png')
-                    # torchvision.utils.save_image(final_image, train_result_dir / f'{total_iter}_final.png')
-                    # torchvision.utils.save_image(gt_image, train_result_dir / f'{total_iter}_gt.png')
-                    # torchvision.utils.save_image(base_color, train_result_dir / f'{total_iter}_base.png')
+                    base_color = render_pkg_last_train[view_cur.image_name]['render']
+                    residual_color = final_image - base_color
+                    loss_map = torch.abs(final_image - gt_image).sum(dim=0)
+                    torchvision.utils.save_image(loss_map, train_result_dir / f'{total_iter}_l1loss.png')
+                    torchvision.utils.save_image(residual_color, train_result_dir / f'{total_iter}_residual_color.png')
+                    torchvision.utils.save_image(final_image, train_result_dir / f'{total_iter}_final.png')
+                    torchvision.utils.save_image(gt_image, train_result_dir / f'{total_iter}_gt.png')
+                    torchvision.utils.save_image(base_color, train_result_dir / f'{total_iter}_base.png')
 
 
                 if tb_writer:
-                    base_color = render_pkg_train[view_cur.uid]['render']
+                    base_color = render_pkg_last_train[view_cur.image_name]['render']
                     residual_color = final_image - base_color
-                    tb_writer.add_scalar('train_depth/geo_loss', loss_geo_dict['geo'].item() + loss_geo_dict['color'].item(), total_iter)
-                    tb_writer.add_scalar('train_depth/depth_loss', loss_geo_dict['geo'].item(), total_iter)
-                    tb_writer.add_scalar('train_depth/color_loss', loss_geo_dict['color'].item(), total_iter)
-                    # tb_writer.add_scalar('train_depth/depth_loss2', loss_depth2.item(), total_iter)
-                    # tb_writer.add_scalar('train_depth/color_loss2', loss_corr_color2.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/geo_loss', loss_geo.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/depth_loss', loss_depth.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/color_loss', loss_corr_color.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/depth_loss2', loss_depth2.item(), total_iter)
+                    tb_writer.add_scalar('train_depth/color_loss2', loss_corr_color2.item(), total_iter)
                     tb_writer.add_scalar('scene/lr_tcnn', residual_opt.param_groups[0]['lr'], total_iter)
                     # tb_writer.add_scalar('train_depth/neighbor_color_loss', loss_neighbor_color.item(), total_iter)
                     # tb_writer.add_scalar('train_depth/neighbor_residual_color_loss', loss_neighbor_residual_color.item(), total_iter)
 
-                    # tb_writer.add_scalar('train_residual/l1_loss', Ll1_render.item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/rgb_loss', loss_rgb.item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/loss', loss.item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/psnr', psnr_val.item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/ssim', ssim_loss.item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/residual_color_max', residual_color.max().item(), total_iter)
-                    # tb_writer.add_scalar('train_residual/residual_color_min', residual_color.min().item(), total_iter)
+                    tb_writer.add_scalar('train_residual/l1_loss', Ll1_render.item(), total_iter)
+                    tb_writer.add_scalar('train_residual/rgb_loss', loss_rgb.item(), total_iter)
+                    tb_writer.add_scalar('train_residual/loss', loss.item(), total_iter)
+                    tb_writer.add_scalar('train_residual/psnr', psnr_val.item(), total_iter)
+                    tb_writer.add_scalar('train_residual/ssim', ssim_loss.item(), total_iter)
+                    tb_writer.add_scalar('train_residual/residual_color_max', residual_color.max().item(), total_iter)
+                    tb_writer.add_scalar('train_residual/residual_color_min', residual_color.min().item(), total_iter)
 
 
             if iteration in testing_iterations or iteration == opt.lap_level_upgrade_interval: # or iteration == 1:
@@ -992,7 +991,6 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     # torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    # torch.autograd.set_detect_anomaly(True)
     training(dataset=lp.extract(args), 
              opt=op.extract(args), 
              pipe=pp.extract(args), 

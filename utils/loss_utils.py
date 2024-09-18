@@ -14,6 +14,9 @@ import torch.nn.functional as F
 import math
 from torch.autograd import Variable
 from math import exp
+from scene.cameras import Camera
+from utils.graphics_utils import patch_warp
+
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -108,6 +111,108 @@ def _ncc(img1, img2, window, window_size, channel, size_average=True):
 
 #     return torch.mean(ncc, dim=2)
 
+
+
+def loss_in_neighbor_view(
+        view_cur: Camera, view_neighbor: Camera, 
+        pts_data_cur: dict, pts_data_neighbor: dict,
+        patch_template: torch.Tensor,
+        depth_valid_threshold: float,
+    ) -> dict:
+
+    pts_homo_proj = pts_data_cur['pts_homo'] @ view_neighbor.world_view_transform
+    proj_uvw = pts_homo_proj[:, :3] @ view_neighbor.intrins
+    proj_depth = proj_uvw[:, 2:3]
+    proj_uv = proj_uvw / proj_depth
+    proj_uv[:, 0] = proj_uv[:, 0] / (view_neighbor.image_width-1) * 2 - 1
+    proj_uv[:, 1] = proj_uv[:, 1] / (view_neighbor.image_height-1) * 2 - 1
+    proj_uv_mask = \
+        (proj_uv[:, 0] > -1) & (proj_uv[:, 0] < 1) & (proj_uv[:, 1] > -1) & (proj_uv[:, 1] < 1) & \
+        (proj_depth.squeeze(1) > 0.1) & (proj_depth.squeeze(1) < 6)
+    proj_uv = proj_uv[:, :2].reshape(1, -1, 1, 2)
+
+    sampled_depth = F.grid_sample(
+        pts_data_neighbor['depth'], 
+        proj_uv, mode='bilinear', align_corners=True
+    ).squeeze()
+
+    diff_depth = (sampled_depth - proj_depth.squeeze(1)).abs()
+    valid_mask = (diff_depth < depth_valid_threshold) & proj_uv_mask
+    valid_mask = valid_mask & (pts_data_cur['homo_plane_depth'].view(-1) > 0)
+
+    weights = (1.0 / torch.exp(diff_depth)).detach()
+    weights[~valid_mask] = 0
+
+    loss_geo = torch.mean(weights * diff_depth)
+    total_patch_size = patch_template.shape[1]
+    # pts_data_cur_normal = pts_data_cur['normal'].view(-1, 3)
+    # valid_mask = valid_mask & (pts_data_cur_normal.norm(dim=-1) > 0)
+
+    # valid_mask = torch.zeros_like(valid_mask, dtype=bool)
+    # valid_mask[71187] = True
+    # valid_mask[399859] = True
+
+    with torch.no_grad():
+        ori_pixels_patch = patch_template.clone()[valid_mask]
+
+        H, W = view_cur.gt_gray_img.squeeze().shape
+        pixels_patch = ori_pixels_patch.clone()
+        pixels_patch[:, :, 0] = 2 * pixels_patch[:, :, 0] / (W - 1) - 1.0
+        pixels_patch[:, :, 1] = 2 * pixels_patch[:, :, 1] / (H - 1) - 1.0
+        ref_gray_val = F.grid_sample(view_cur.gt_gray_img.unsqueeze(1), pixels_patch.view(1, -1, 1, 2), align_corners=True)
+        ref_gray_val = ref_gray_val.reshape(-1, total_patch_size)
+
+        ref_to_neareast_r = view_neighbor.world_view_transform[:3,:3].transpose(-1,-2) @ view_cur.world_view_transform[:3,:3]
+        ref_to_neareast_t = -ref_to_neareast_r @ view_cur.world_view_transform[3,:3] + view_neighbor.world_view_transform[3,:3]
+    
+    # compute Homography
+    ref_local_n = pts_data_cur['normal'].view(-1, 3)[valid_mask]
+    ref_local_d = pts_data_cur['homo_plane_depth'].view(-1)[valid_mask]
+    # print('min depth', ref_local_d.min())
+
+    # ref_local_d[0] = 1.0506
+    # ref_local_d[1] = 1.3158
+
+    # ref_local_n[0] = torch.tensor([-0.3, 0.1, -0.65]).cuda()
+    # ref_local_n[1] = torch.tensor([-0.2, -0.04, -0.64]).cuda()
+
+    H_ref_to_neareast = ref_to_neareast_r[None] - \
+        torch.matmul(ref_to_neareast_t[None,:,None].expand(ref_local_d.shape[0],3,1), 
+                    ref_local_n[:,:,None].expand(ref_local_d.shape[0],3,1).permute(0, 2, 1))/ref_local_d[...,None,None]
+    # H_ref_to_neareast = ref_to_neareast_r[None] - ref_to_neareast_t[None,:,None].expand(ref_local_d.shape[0],3,1)
+    H_ref_to_neareast = torch.matmul(view_neighbor.intrins.T[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
+    H_ref_to_neareast = H_ref_to_neareast @ view_cur.intrins_inv.T
+    
+    ## compute neareast frame patch
+    grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
+    grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
+    grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
+    sampled_gray_val = F.grid_sample(
+        view_neighbor.gt_gray_img.unsqueeze(0), 
+        grid.reshape(1, -1, 1, 2), 
+        align_corners=True
+    )
+    sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
+
+    ncc, ncc_mask = lncc(ref_gray_val, sampled_gray_val)
+    ncc = ncc.reshape(-1) * weights[valid_mask]
+    loss_ncc = ncc[ncc_mask.reshape(-1)].mean() 
+    # if color_map_neighbor is not None:
+    #     # loss_color = (sampled_color - pts_colors)[valid_mask].abs().mean()
+    #     ncc, ncc_mask = lncc(sampled_color[valid_mask], pts_colors[valid_mask])
+    #     loss_color = ncc[ncc_mask.squeeze()].mean()
+    loss_dict = {
+        'geo': loss_geo,
+        'color': loss_ncc,
+    }
+
+    debug_dict = {
+        'cur_patch': pixels_patch,
+        'neighbor_patch': grid,
+        'depth_err': diff_depth.reshape(view_cur.image_height, view_cur.image_width),
+    }
+
+    return loss_dict, debug_dict
 
 
 def lncc(ref, nea):

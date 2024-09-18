@@ -90,18 +90,19 @@ class Camera(nn.Module):
         self.intrins = basic_intrins.T.clone()
         self.intrins[:, 0] *= self.image_width
         self.intrins[:, 1] *= self.image_height
+        self.intrins_inv = torch.inverse(self.intrins)
         self.basic_intrins_inv = torch.inverse(basic_intrins).T
         self.rot_vec = rot_mat_to_rot_vec(R)
 
-        gray_img = self.original_image.mean(0).unsqueeze(0)
-        offsets = [(i, j) for i in range(-2, 3) for j in range(-2, 3)]
-        padded_img = nn.functional.pad(gray_img, (2, 2, 2, 2), mode='reflect')  # shape (3, H+4, W+4)
-        features = []
-        for dy, dx in offsets:
-            # Shift the image to access neighbors
-            neighbor = padded_img[:, 2+dy:self.image_height+2+dy, 2+dx:self.image_width+2+dx]
-            features.append(neighbor)
-        self.gray_patch_feat = torch.concat(features, dim=0).unsqueeze(0)
+        self.gt_gray_img = self.original_image.mean(0).unsqueeze(0)
+        # offsets = [(i, j) for i in range(-2, 3) for j in range(-2, 3)]
+        # padded_img = nn.functional.pad(self.gray_img, (2, 2, 2, 2), mode='reflect')  # shape (3, H+4, W+4)
+        # features = []
+        # for dy, dx in offsets:
+        #     # Shift the image to access neighbors
+        #     neighbor = padded_img[:, 2+dy:self.image_height+2+dy, 2+dx:self.image_width+2+dx]
+        #     features.append(neighbor)
+        # self.gray_patch_feat = torch.concat(features, dim=0).unsqueeze(0)
 
 
 class MiniCam:

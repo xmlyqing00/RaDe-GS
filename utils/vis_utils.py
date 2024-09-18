@@ -8,6 +8,42 @@ import numpy as np
 from trimesh import primitives, util
 
 
+def vis_patch(debug_dict: dict, cur_img, neighbor_img, ids: list):
+
+    H, W = cur_img.shape[1:]
+    gt_img_cur = (cur_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    gt_img_neighbor = (neighbor_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+    img_cur = np.zeros((H, W, 3), dtype=np.uint8)
+    img_neighbor = np.zeros((H, W, 3), dtype=np.uint8)
+    p_num = debug_dict['cur_patch'].shape[1]
+    
+    for patch_id in ids:
+        c = np.random.randint(50, 255, 3)
+        for pid in range(p_num):
+            x, y = debug_dict['cur_patch'][patch_id, pid]
+            x, y = int((x.item() + 1) * (W - 1) / 2), int((y.item() + 1) * (H - 1) / 2)
+            if x >= 0 and x < W and y >= 0 and y < H:
+                img_cur[y, x] = c
+                gt_img_cur[y, x] = c
+            else:
+                print('outside cur patch_id:', patch_id, 'pid:', pid, 'x:', x, 'y:', y)
+            x, y = debug_dict['neighbor_patch'][patch_id, pid]
+            x, y = int((x.item() + 1) * (W - 1) / 2), int((y.item() + 1) * (H - 1) / 2)
+            if x >= 0 and x < W and y >= 0 and y < H:
+                img_neighbor[y, x] = c
+                gt_img_neighbor[y, x] = c
+            else:
+                print('outside neighbor patch_id:', patch_id, 'pid:', pid, 'x:', x, 'y:', y)
+    
+    return {
+        'gt_img_cur': gt_img_cur,  
+        'gt_img_neighbor': gt_img_neighbor,
+        'img_patch_cur': img_cur,
+        'img_patch_neighbor': img_neighbor
+    }
+
+
 def apply_colormap(image, cmap="viridis"):
     colormap = cm.get_cmap(cmap)
     colormap = torch.tensor(colormap.colors).to(image.device)  # type: ignore

@@ -65,6 +65,8 @@ class ModelParams(ParamGroup):
         self.tcnn_num_layers: int = 4
         self.scene_range = 5 # for hotdog
         self.scene_min = -self.scene_range / 2
+        self.far_plane = 5
+        self.near_plane = 3
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -108,11 +110,11 @@ class OptimizationParams(ParamGroup):
         # self.regularization_from_iter = 15_000
         self.densify_grad_threshold = 0.0002 # 0.0002
 
-        self.residual_lr = 1e-3
+        self.residual_lr = 1e-4
         self.depth_opt_from_iter = self.base_iterations // 2
         # self.union_l1loss_interval = 3_000
         self.new_gauss_view_num: int = 1
-        self.depth_valid_threshold: float = 30
+        self.depth_valid_threshold: float = 1
 
         self.verbose = True
 
